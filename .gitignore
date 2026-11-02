@@ -1,0 +1,33 @@
+# Python & Virtual Environment
+backend/venv/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Node & Frontend build
+node_modules/
+frontend/dist/
+frontend/release/
+*.tsbuildinfo
+
+# Local runtime state, SQLite WAL files & security tokens (NEVER commit!)
+.lgraph_runtime/
+backend/storage_data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.token
+*.log
+*.lnk
+.env
+.env.local
+
+# OS & IDE files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,13 @@
+{
+  "name": "independent-auditor",
+  "displayName": "Independent Red-Team Auditor",
+  "version": "2.0.0",
+  "author": "Lgraph Open Source",
+  "description": "Независимый архитектурный и код-аудитор с чистым контекстом (Zero-Context Red-Team Subagent) для всех проектов: Cold Plan Audit и Cold Code Audit с опорой на Lgraph и официальную документацию.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Проведи Cold Plan Audit текущего плана реализации через независимого субагента-аудитора",
+    "Запусти полный Cold Code Audit изменённых модулей до 0 P0 и 0 P1 со сверкой документации",
+    "Проверь безопасность, конкурентность и межъязыковые контракты проекта через independent-auditor"
+  ]
+}

@@ -1,0 +1,40 @@
+guardrails:
+  - rule_id: "GR-LAYER-01"
+    title: "Запрет прямого обращения UI-слоя к базе данных"
+    severity: "blocker"
+    scope: "backend/presentation/**"
+    predicate_type: "forbidden_dependency"
+    predicate_params:
+      target_scope: "backend/db/**"
+    rationale_ru: "Компоненты представления не должны импортировать движок БД напрямую в обход сервисного слоя."
+    remediation_ru: "Вынесите работу с БД в `backend/services/` и вызывайте сервисный метод."
+
+  - rule_id: "GR-UI-SELECT"
+    title: "Запрет нативного HTML <select> в UI-компонентах"
+    severity: "blocker"
+    scope: "frontend/ui/**"
+    exclude_scope: "frontend/ui/legacy/**"
+    predicate_type: "ast_forbidden_regex"
+    predicate_params:
+      pattern: "<select\\b"
+    rationale_ru: "Нативный <select> в Windows рендерит системное синее меню вместо кастомной дизайн-системы."
+    remediation_ru: "Замените <select> на кастомный компонент CustomSelect."
+
+  - rule_id: "GR-SIZE-01"
+    title: "Контроль анти-монолита сервисных файлов"
+    severity: "warning"
+    scope: "backend/services/**"
+    predicate_type: "max_file_lines"
+    predicate_params:
+      max_lines: 15
+    rationale_ru: "Раздутые файлы усложняют поддержку и перегружают контекст ИИ."
+    remediation_ru: "Разделите крупный сервисный файл на сфокусированные модули."
+
+  - rule_id: "GR-CYCLE-01"
+    title: "Запрет циклических импортов в ядре"
+    severity: "blocker"
+    scope: "backend/domain/**"
+    predicate_type: "no_cycles"
+    predicate_params: {}
+    rationale_ru: "Циклические импорты приводят к ImportError при старте и запутывают архитектуру."
+    remediation_ru: "Выделите общие контракты в отдельный модуль без обратного импорта."

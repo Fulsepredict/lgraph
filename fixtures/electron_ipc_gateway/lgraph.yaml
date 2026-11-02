@@ -1,0 +1,5 @@
+# Конфиг проектных адаптеров Lgraph для кастомных клиентских HTTP/IPC обёрток
+bridge_adapters:
+  http_wrappers:
+    - caller_name: "appFetch"
+      prepend_prefix: "/api"

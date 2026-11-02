@@ -1,0 +1,36 @@
+# Конфигурация самоконтроля архитектуры и межъязыковых мостов самого проекта Lgraph
+bridge_adapters:
+  http_wrappers:
+    - caller_name: "lgraphFetch"
+      prepend_prefix: "/api"
+
+guardrails:
+  - rule_id: "GR-LGRAPH-SIZE"
+    title: "Анти-монолит модулей Lgraph (не более 350 строк)"
+    severity: "blocker"
+    scope: "*.py,scripts/**,backend/**,frontend/src/**,frontend/electron/**"
+    exclude_scope: "backend/tests/**"
+    predicate_type: "max_file_lines"
+    predicate_params:
+      max_lines: 350
+    rationale_ru: "Каждый модуль Lgraph обязан решать ровно одну задачу и помещаться в компактное окно контекста."
+    remediation_ru: "Разделите выросший файл на сфокусированные дочерние модули или UI-компоненты."
+
+  - rule_id: "GR-LGRAPH-UI-SELECT"
+    title: "Запрет системного HTML <select> в монохромном интерфейсе"
+    severity: "blocker"
+    scope: "frontend/src/**"
+    predicate_type: "ast_forbidden_regex"
+    predicate_params:
+      pattern: "<select\\b"
+    rationale_ru: "Системный <select> в Windows рисует чужеродное бело-синее меню поверх тёмно-графитового интерфейса."
+    remediation_ru: "Используйте кастомные кнопки переключения режимов или монохромный выпадающий список."
+
+  - rule_id: "GR-LGRAPH-CYCLES"
+    title: "Отсутствие циклических импортов в серверном ядре"
+    severity: "blocker"
+    scope: "backend/**"
+    predicate_type: "no_cycles"
+    predicate_params: {}
+    rationale_ru: "Циклические зависимости между слоями анализаторов и хранилища разрушают модульность ядра."
+    remediation_ru: "Вынесите общие модели данных в `backend/core/models.py`."

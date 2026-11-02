@@ -1,0 +1,26 @@
+{
+  "description": "Полигон многоступенчатого шлюза React -> кастомный appFetch -> Electron preload/ipcMain -> FastAPI + динамический IPC вызов",
+  "expected_bridges": [
+    {
+      "src_uri": "ts://frontend/src/services/api.ts#triggerProfileCheck",
+      "dst_uri": "py://backend/routes_profiles.py#check_profile_alive",
+      "protocol": "HTTP",
+      "method": "POST"
+    },
+    {
+      "src_uri": "js://frontend/electron/preload.cjs",
+      "dst_uri": "js://frontend/electron/ipcGateway.cjs#registerIpcHandlers",
+      "protocol": "IPC",
+      "channel": "window:open"
+    },
+    {
+      "src_uri": "js://frontend/electron/preload.cjs",
+      "dst_uri": "js://frontend/electron/ipcGateway.cjs#registerIpcHandlers",
+      "protocol": "IPC",
+      "channel": "app-api:request"
+    }
+  ],
+  "expected_unresolved_dynamic_sources": [
+    "js://frontend/electron/preload.cjs"
+  ]
+}

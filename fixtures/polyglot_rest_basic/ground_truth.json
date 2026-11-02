@@ -1,0 +1,24 @@
+{
+  "description": "Базовый полигон прямого сопоставления TypeScript fetch <-> FastAPI APIRouter с параметрами пути и негативным DELETE-маршрутом",
+  "expected_bridges": [
+    {
+      "src_uri": "ts://frontend/src/ordersApi.ts#fetchOrderDetails",
+      "dst_uri": "py://backend/routes_orders.py#get_order",
+      "protocol": "HTTP",
+      "method": "GET",
+      "route": "/api/orders/{param}"
+    },
+    {
+      "src_uri": "ts://frontend/src/ordersApi.ts#submitOrderConfirmation",
+      "dst_uri": "py://backend/routes_orders.py#confirm_order",
+      "protocol": "HTTP",
+      "method": "POST",
+      "route": "/api/orders/{param}/confirm"
+    }
+  ],
+  "forbidden_false_bridges": [
+    {
+      "dst_uri": "py://backend/routes_orders.py#cancel_order"
+    }
+  ]
+}

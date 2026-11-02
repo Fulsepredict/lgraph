@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <linearGradient id="shieldBg" x1="96" y1="64" x2="416" y2="448" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#27272A"/>
+      <stop offset="100%" stop-color="#111114"/>
+    </linearGradient>
+    <linearGradient id="rubyGlow" x1="176" y1="144" x2="336" y2="368" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FB7185"/>
+      <stop offset="55%" stop-color="#E11D48"/>
+      <stop offset="100%" stop-color="#881337"/>
+    </linearGradient>
+  </defs>
+  <path d="M256 60L412 122V244C412 344 344 422 256 456C168 422 100 344 100 244V122L256 60Z" fill="url(#shieldBg)" stroke="#52525B" stroke-width="14" stroke-linejoin="round"/>
+  <path d="M256 92L382 142V242C382 324 328 389 256 420C184 389 130 324 130 242V142L256 92Z" stroke="url(#rubyGlow)" stroke-width="6" stroke-opacity="0.65" stroke-linejoin="round"/>
+  <circle cx="256" cy="248" r="78" stroke="url(#rubyGlow)" stroke-width="16"/>
+  <circle cx="256" cy="248" r="22" fill="url(#rubyGlow)"/>
+  <path d="M256 142V178M256 318V354M150 248H186M326 248H362" stroke="#F4F4F5" stroke-width="14" stroke-linecap="round"/>
+</svg>

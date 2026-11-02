@@ -1,0 +1,12 @@
+{
+  "description": "Эталонный полигон проверки всех машинных предикатов GuardrailEngine и исключений exclude_scope",
+  "expected_violated_rule_ids": [
+    "GR-LAYER-01",
+    "GR-UI-SELECT",
+    "GR-SIZE-01",
+    "GR-CYCLE-01"
+  ],
+  "forbidden_false_violation_paths": [
+    "frontend/ui/legacy/LegacyDropdown.tsx"
+  ]
+}

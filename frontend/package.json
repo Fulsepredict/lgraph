@@ -1,0 +1,34 @@
+{
+  "name": "lgraph-desktop",
+  "private": true,
+  "type": "module",
+  "version": "2.4.0",
+  "description": "Lgraph — Architecture, Contract & Context Intelligence Platform",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "backend:dev": "..\\backend\\venv\\Scripts\\python.exe -m uvicorn backend.api.main:app --app-dir .. --host 127.0.0.1 --port 8765",
+    "dev": "vite --host 127.0.0.1 --port 5179 --strictPort",
+    "build": "tsc -b && vite build",
+    "electron:start": "electron ."
+  },
+  "dependencies": {
+    "@xyflow/react": "^12.10.0",
+    "elkjs": "^0.11.0",
+    "lucide-react": "^0.454.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "zustand": "^5.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.8.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.3",
+    "autoprefixer": "^10.4.20",
+    "electron": "^33.2.0",
+    "postcss": "^8.4.47",
+    "tailwindcss": "^3.4.14",
+    "typescript": "~5.6.2",
+    "vite": "^5.4.10"
+  }
+}

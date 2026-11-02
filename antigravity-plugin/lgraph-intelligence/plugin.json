@@ -1,0 +1,13 @@
+{
+  "name": "lgraph-intelligence",
+  "displayName": "Lgraph Intelligence",
+  "version": "2.4.0",
+  "author": "Lgraph Open Source",
+  "description": "Локальный архитектурный радар Lgraph: 6 инструментов MCP, сжатие контекста по PageRank, сшивка мостов Frontend-IPC-Backend и машинные правила Guardrails.",
+  "logo": "assets/logo.png",
+  "suggestedPrompts": [
+    "Собери архитектурную капсулу get_context_pack по текущему проекту и покажи ключевые мосты и риски",
+    "Проверь радиус зацепления simulate_change_impact перед изменением контрактов API и IPC",
+    "Запусти verify_architecture_rules по проекту и объясни найденные нарушения простым языком"
+  ]
+}
