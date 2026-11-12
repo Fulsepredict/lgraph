@@ -45,6 +45,7 @@ class JsTsFileParseResult:
     imports: list[str] = field(default_factory=list)
     calls: list[tuple[str, str]] = field(default_factory=list)
     raw_call_sites: list[dict[str, Any]] = field(default_factory=list)
+    has_redacted_secret: bool = False
 
 
 def _node_text(node: Node | None, source_bytes: bytes) -> str:
@@ -111,7 +112,9 @@ def parse_js_ts_file(rel_path: str, source_bytes: bytes, file_risk: RiskLevel) -
 
         if child.type == "import_statement":
             src_node = child.child_by_field_name("source")
-            imp_str = _node_text(src_node, source_bytes).strip("\"'` ")
+            imp_str, imp_sec = redact_inline_secrets(_node_text(src_node, source_bytes).strip("\"'` "))
+            if imp_sec:
+                result.has_redacted_secret = True
             if imp_str:
                 result.imports.append(imp_str)
 
@@ -222,7 +225,8 @@ def parse_js_ts_file(rel_path: str, source_bytes: bytes, file_risk: RiskLevel) -
                                 )
 
     # Сканируем все вызовы верхнего и вложенного уровня (CommonJS `require`, `ipcRenderer`, `fetch` и др.)
-    scan_js_call_expressions(
+    known_symbol_uris = {n.uri for n in result.nodes}
+    calls_had_secret = scan_js_call_expressions(
         root=root,
         file_uri=file_uri,
         scheme=scheme,
@@ -231,7 +235,10 @@ def parse_js_ts_file(rel_path: str, source_bytes: bytes, file_risk: RiskLevel) -
         out_imports=result.imports,
         out_calls=result.calls,
         out_call_sites=result.raw_call_sites,
+        known_symbol_uris=known_symbol_uris,
     )
+    if calls_had_secret:
+        result.has_redacted_secret = True
     return result
 
 
@@ -253,7 +260,9 @@ def _extract_js_function(
     ret_txt = _node_text(ret_node, source_bytes).strip() if ret_node else ""
     body_node = fn_node.child_by_field_name("body")
     fn_uri = build_canonical_uri(scheme, rel_path, fn_name)
-    sig, _ = redact_inline_secrets(f"function {fn_name}{params_txt}{ret_txt}")
+    sig, sig_sec = redact_inline_secrets(f"function {fn_name}{params_txt}{ret_txt}")
+    if sig_sec:
+        result.has_redacted_secret = True
 
     result.nodes.append(
         GraphNodeRecord(

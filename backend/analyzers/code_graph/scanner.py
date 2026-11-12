@@ -31,23 +31,29 @@ from backend.analyzers.code_graph.disk_state import (
 from backend.analyzers.code_graph.import_resolver import resolve_js_ts_imports, resolve_python_imports
 from backend.analyzers.code_graph.ts_js_parser import JsTsFileParseResult, parse_js_ts_file
 from backend.analyzers.code_graph.ts_python_parser import PythonFileParseResult, parse_python_file
-from backend.core.config import (
-    PARSER_SCHEMA_VERSION,
-    get_project_index_lock,
-    validate_safe_project_root,
-)
+from backend.core.config import PARSER_SCHEMA_VERSION, get_project_index_lock, validate_safe_project_root
 from backend.core.models import (
-    ConfidenceTier,
-    EdgeType,
-    GraphEdgeRecord,
-    GraphNodeRecord,
-    GuardrailRuleSpec,
-    NodeType,
-    RiskLevel,
-    compute_sha256_bytes,
-    redact_inline_secrets,
+    ConfidenceTier, EdgeType, GraphEdgeRecord, GraphNodeRecord, GuardrailRuleSpec,
+    NodeType, RiskLevel, compute_sha256_bytes, redact_inline_secrets,
 )
 from backend.storage.repository import GraphRepository
+
+
+def _redact_payload_values(obj: Any) -> tuple[Any, bool]:
+    """Гарантирует отсутствие сырых секретов в любых строковых полях AST-кэша перед `json.dumps`."""
+    if isinstance(obj, str):
+        return redact_inline_secrets(obj)
+    if isinstance(obj, (list, tuple)):
+        pairs = [_redact_payload_values(x) for x in obj]
+        return [v for v, _ in pairs], any(f for _, f in pairs)
+    if isinstance(obj, dict):
+        out: dict[str, Any] = {}
+        found = False
+        for k, val in obj.items():
+            v, f = (val, False) if k in ("node_type", "risk_level", "lang") else _redact_payload_values(val)
+            out[k], found = v, (found or f)
+        return out, found
+    return obj, False
 
 
 def _extract_guardrail_specs_from_yaml(project_root: Path) -> list[GuardrailRuleSpec]:
@@ -89,6 +95,8 @@ def index_project_directory(project_root_raw: str | Path, repo: GraphRepository)
 def _index_project_locked(
     root: Path, proj_row: dict[str, Any], project_id: str, repo: GraphRepository, t0: float
 ) -> dict[str, Any]:
+    # Fail-Closed: валидируем lgraph.yaml до сканирования и до любой записи в SQLite
+    guardrails = _extract_guardrail_specs_from_yaml(root)
     existing_cache = repo.get_file_cache_map(project_id)
     ignore_globs = load_ignore_globs(root)
     config_fp_ns = compute_config_fingerprint_ns(root)
@@ -181,6 +189,8 @@ def _index_project_locked(
                 }
             else:
                 js_res: JsTsFileParseResult = parse_js_ts_file(rel_path, raw_bytes, file_risk)
+                if js_res.has_redacted_secret:
+                    had_secret = True
                 payload = {
                     "lang": js_res.scheme,
                     "nodes": [dataclasses.asdict(n) for n in js_res.nodes],
@@ -191,6 +201,12 @@ def _index_project_locked(
                     "router_includes": [],
                     "js_call_sites": js_res.raw_call_sites,
                 }
+            payload, payload_sec = _redact_payload_values(payload)
+            if payload_sec:
+                had_secret = True
+            if had_secret:
+                for nd_dict in payload["nodes"]:
+                    nd_dict["risk_level"] = RiskLevel.CRITICAL.value
 
         restored_nodes = [
             GraphNodeRecord(
@@ -301,7 +317,6 @@ def _index_project_locked(
     code_edges.extend(c_edges)
 
     # Передаём список правил явно (включая `[]`), чтобы удаление правил из lgraph.yaml очищало их в БД
-    guardrails = _extract_guardrail_specs_from_yaml(root)
     revision = repo.save_full_index_atomic(
         project_id=project_id,
         nodes=all_nodes,

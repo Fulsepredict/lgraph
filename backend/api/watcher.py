@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 from contextlib import closing
 from pathlib import Path
@@ -35,25 +36,49 @@ class _DebouncedProjectHandler(FileSystemEventHandler):
         super().__init__()
         self._project_id = project_id
         self._project_root = project_root
+        raw_norm = os.path.normpath(str(project_root)).replace("\\", "/").rstrip("/")
+        res_norm = str(project_root.resolve()).replace("\\", "/").rstrip("/")
+        self._root_prefixes: tuple[str, ...] = tuple(dict.fromkeys(p for p in (res_norm, raw_norm) if p))
         self._repo = repo
         self._lock = threading.Lock()
         self._timer: threading.Timer | None = None
 
-    def on_any_event(self, event: FileSystemEvent) -> None:
-        src = str(getattr(event, "src_path", "") or "")
-        if not src:
-            return
-        norm = src.replace("\\", "/")
-        parts = [p for p in norm.split("/") if p]
+    def _is_tracked_event_path(self, raw_path: str | bytes) -> bool:
+        """
+        Проверяет путь строго относительно `self._project_root`, чтобы родительские папки ОС
+        вне корня проекта (например, `D:\\release\\my_service`) не блокировали наблюдение.
+        """
+        text = os.fsdecode(raw_path).strip() if raw_path else ""
+        if not text:
+            return False
+        norm_p = os.path.normpath(text).replace("\\", "/").rstrip("/")
+        cmp_p = norm_p.lower() if os.name == "nt" else norm_p
+
+        rel_parts: list[str] | None = None
+        for root_pref in self._root_prefixes:
+            cmp_r = root_pref.lower() if os.name == "nt" else root_pref
+            if cmp_p.startswith(cmp_r + "/"):
+                rel = norm_p[len(root_pref) + 1 :]
+                rel_parts = [seg for seg in rel.split("/") if seg and seg != "."]
+                break
+        if not rel_parts:
+            return False
 
         # Реагируем на смену ветки Git (`.git/HEAD`), но игнорируем внутренний мусор `.git/objects`
-        is_git_head = norm.endswith("/.git/HEAD")
-        if not is_git_head:
-            if any(should_ignore_dir(p) for p in parts[:-1]):
-                return
-            suffix = Path(src).suffix.lower()
-            if suffix not in _WATCHED_SUFFIXES:
-                return
+        if rel_parts == [".git", "HEAD"]:
+            return True
+        if any(should_ignore_dir(p) for p in rel_parts[:-1]):
+            return False
+        fname = rel_parts[-1]
+        if fname in (".lgraphignore", ".projectgraphignore"):
+            return True
+        return Path(fname).suffix.lower() in _WATCHED_SUFFIXES
+
+    def on_any_event(self, event: FileSystemEvent) -> None:
+        src = getattr(event, "src_path", "") or ""
+        dest = getattr(event, "dest_path", "") or ""
+        if not (self._is_tracked_event_path(src) or self._is_tracked_event_path(dest)):
+            return
 
         self._mark_project_stale()
         with self._lock:

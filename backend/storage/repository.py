@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-from contextlib import closing
+import sqlite3
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -28,9 +30,36 @@ from backend.core.models import (
 )
 from backend.storage.schema import initialize_database, open_sqlite_connection
 
+SQLITE_WRITE_BUSY_TIMEOUT_MS: int = 15000
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+@contextmanager
+def begin_immediate_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """
+    Явно открывает транзакцию записи `BEGIN IMMEDIATE` до первого `SELECT`.
+    Почему это критично в SQLite WAL: отложенный `with conn:` захватывает write-lock только на первом
+    `INSERT/DELETE`, из-за чего предварительный `SELECT` при параллельной записи из другого процесса
+    не ждёт `busy_timeout`, а сразу падает с `SQLITE_BUSY` (`database is locked`).
+    """
+    conn.execute(f"PRAGMA busy_timeout={SQLITE_WRITE_BUSY_TIMEOUT_MS};")
+    if conn.in_transaction:
+        conn.commit()
+    prev_isolation = conn.isolation_level
+    conn.isolation_level = None
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield conn
+        conn.execute("COMMIT")
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.isolation_level = prev_isolation
 
 
 def compute_project_id(root_path: Path) -> str:
@@ -52,7 +81,7 @@ class GraphRepository:
         project_id = compute_project_id(resolved)
         proj_name = name or resolved.name
         with closing(open_sqlite_connection(self.db_path)) as conn:
-            with conn:
+            with begin_immediate_transaction(conn):
                 conn.execute(
                     """
                     INSERT INTO projects (project_id, name, root_path)
@@ -105,7 +134,7 @@ class GraphRepository:
         """
         now_iso = utc_now_iso()
         with closing(open_sqlite_connection(self.db_path)) as conn:
-            with conn:
+            with begin_immediate_transaction(conn):
                 rev_row = conn.execute(
                     "SELECT index_revision FROM projects WHERE project_id = ?",
                     (project_id,),
@@ -127,7 +156,7 @@ class GraphRepository:
                 fts_tuples: list[tuple[Any, ...]] = []
                 for n in nodes:
                     saved_note = notes_by_uri.get(n.uri)
-                    raw_summary = saved_note["summary_ru"] if saved_note and saved_note["summary_ru"] else n.summary_ru
+                    raw_summary = saved_note["summary_ru"] if saved_note is not None else n.summary_ru
                     summary_ru, _ = redact_inline_secrets(raw_summary)
                     safe_sig, _ = redact_inline_secrets(n.signature)
                     risk_val = (

@@ -1,7 +1,7 @@
 # 🧠 Память проекта: Lgraph (Architecture, Contract & Context Intelligence)
 
-**Дата последнего обновления:** 2026-11-02
-**Версия:** `v2.4.0` | **Правил-предохранителей (G):** `14` (разборы инцидентов — в `.agent/MEMORY_ARCHIVE.md`)
+**Дата последнего обновления:** 2026-11-11
+**Версия:** `v2.4.1` | **Правил-предохранителей (G):** `15` (разборы инцидентов — в `.agent/MEMORY_ARCHIVE.md`)
 
 ---
 
@@ -26,5 +26,7 @@
 - **G-10 (Фильтрация визуальных рёбер `RC-05`):** Графовые предикаты, `PageRank` и обход соседей обязаны игнорировать синтетические рёбра `c4_rollup` и `CONTAINS`.
 - **G-11 (Двойной барьер маскировки секретов `RC-06`):** `redact_inline_secrets(...)` применяется к `summary_ru`, `signature` и `evidence` как в парсерах AST, так и централизованно в `GraphRepository.save_full_index_atomic`.
 - **G-12 (Автономность `MCP` без `cwd` `RC-07`):** Точка входа `run_mcp_server.py` сама выставляет `sys.path`, пишет логи строго в `sys.stderr`, проверяет `is_project_disk_dirty` перед ответом и отклоняет пустой фильтр `only_paths` предупреждением `WARNING: NO FILES MATCHED FILTER`.
-- **G-13 (Гигиена открытого кода):** В коммиты репозитория запрещено включать личные пути профиля ОС (`C:\Users\...`) и названия закрытых внешних проектов — использовать маркеры `<PATH_TO_LGRAPH>` и скрипт `scripts/install_antigravity_plugin.py`.
-- **G-14 (Безопасность оболочки Windows и IPC показа файлов `RC-08`):** В `lgraph-editor:open-file` всегда проверять `fs.realpathSync.native` и вызывать только `shell.showItemInFolder` (никогда `shell.openPath`, запускающий `.js`/`.bat` через `wscript.exe`); пути в PowerShell передавать строго через `env`, а в `.cmd`/`.bat` включать `chcp 65001 >nul` с возвратом кодовой страницы.
+- **G-13 (Гигиена открытого кода):** В коммиты репозитория запрещено включать личные пути профиля ОС (`%USERPROFILE%\...`) и названия закрытых внешних проектов — использовать маркеры `<PATH_TO_LGRAPH>` и скрипт `scripts/install_antigravity_plugin.py`.
+- **G-14 (Безопасность оболочки Windows, PowerShell UTF-8 и in-place плагины `RC-08`):** В `lgraph-editor:open-file` проверять `fs.realpathSync.native` и вызывать только `shell.showItemInFolder`; пути и текст в PowerShell передавать через `env` при `[Console]::OutputEncoding = UTF8`, а папки плагинов обновлять in-place без `shutil.rmtree` на корневой папке (`WinError 32` от watcher IDE).
+- **G-15 (Межпроцессный `BEGIN IMMEDIATE`, `Fail-Closed` конфиг и чистота `.bat` `RC-09`):** Запись в SQLite WAL всегда открывать через `BEGIN IMMEDIATE` до чтения ревизии; поломка `lgraph.yaml` обязана возвращать ошибку вместо сброса правил в `[]`;
+  `.bat`-лаунчеры держать в 7-bit ASCII с `CRLF`; в `MCP` v2 бросать `ToolError`.

@@ -111,7 +111,7 @@ export async function searchProjectNodes(
  */
 export function cleanHumanDocText(raw: string | null | undefined): string {
   if (!raw) return '';
-  return raw.replace(/<\/?untrusted_code_doc>/g, '').trim();
+  return raw.replace(/<\/?\s*untrusted_code_doc\s*>/gi, '').trim();
 }
 
 /**

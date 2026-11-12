@@ -2,23 +2,33 @@
  * Главный процесс десктопного приложения Lgraph (`electron/main.cjs`).
  *
  * Почему демон запускается с `windowsHide: true` на выделенном порту `127.0.0.1:8765`
- * и защищён `requestSingleInstanceLock()`:
+ * и завершается через `taskkill /T /F` на Windows:
  * 1. При запуске через ярлык или команду `lgraph .` не всплывают чёрные консоли Python.
- * 2. Проверка здоровья демона сверяет совпадение заголовка `X-Lgraph-Token`.
- * 3. Повторный вызов `lgraph <папка>` фокусирует уже открытое окно и без гонок переключает карту.
+ * 2. На Windows `venv\Scripts\python.exe` — пусковой стаб, порождающий дочерний `uvicorn`;
+ *    завершение всего дерева процессов исключает зависание сиротского сервера на порту `8765`.
+ * 3. Навигация окна жёстко ограничена локальным `dist/index.html` (или `127.0.0.1:5179` в dev-режиме).
  */
 
-const { app, BrowserWindow } = require('electron');
-const { spawn } = require('node:child_process');
+const { app, BrowserWindow, session } = require('electron');
+const { execFileSync, spawn } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
+const { pathToFileURL } = require('node:url');
 
 const { initializeDaemonToken, registerIpcGateway } = require('./ipcGateway.cjs');
 
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
 const RUNTIME_DIR = path.join(PROJECT_ROOT, '.lgraph_runtime');
-const DAEMON_BASE_URL = process.env.LGRAPH_DAEMON_URL || 'http://127.0.0.1:8765';
+const DEFAULT_DAEMON_HOST = '127.0.0.1';
+const DEFAULT_DAEMON_PORT = '8765';
+const DAEMON_BASE_URL = process.env.LGRAPH_DAEMON_URL || `http://${DEFAULT_DAEMON_HOST}:${DEFAULT_DAEMON_PORT}`;
+const DEV_SERVER_URL = 'http://127.0.0.1:5179';
 const OPEN_PROJECT_ARG_PREFIX = '--open-project=';
+const DAEMON_BOOT_MAX_ATTEMPTS = 40;
+const DAEMON_BOOT_POLL_MS = 200;
+const HEALTH_CHECK_TIMEOUT_MS = 3_000;
+const APP_CSP =
+  "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; worker-src 'self' blob:; connect-src 'self' http://127.0.0.1:5179 ws://127.0.0.1:5179; object-src 'none'; base-uri 'self';";
 
 let mainWindow = null;
 let daemonProcess = null;
@@ -68,7 +78,10 @@ function resolvePythonExecutable() {
 
 async function isDaemonHealthyAndAuthenticated(daemonToken) {
   try {
-    const healthRes = await fetch(`${DAEMON_BASE_URL}/api/health`, { method: 'GET' });
+    const healthRes = await fetch(`${DAEMON_BASE_URL}/api/health`, {
+      method: 'GET',
+      signal: AbortSignal.timeout(HEALTH_CHECK_TIMEOUT_MS),
+    });
     if (!healthRes.ok) {
       return false;
     }
@@ -79,6 +92,7 @@ async function isDaemonHealthyAndAuthenticated(daemonToken) {
     const authRes = await fetch(`${DAEMON_BASE_URL}/api/projects`, {
       method: 'GET',
       headers: { 'X-Lgraph-Token': daemonToken, Accept: 'application/json' },
+      signal: AbortSignal.timeout(HEALTH_CHECK_TIMEOUT_MS),
     });
     return authRes.status === 200;
   } catch (_err) {
@@ -97,7 +111,15 @@ async function ensurePythonDaemonRunning(daemonToken) {
 
   daemonProcess = spawn(
     pyExe,
-    ['-m', 'uvicorn', 'backend.api.main:app', '--host', '127.0.0.1', '--port', '8765'],
+    [
+      '-m',
+      'uvicorn',
+      'backend.api.main:app',
+      '--host',
+      DEFAULT_DAEMON_HOST,
+      '--port',
+      DEFAULT_DAEMON_PORT,
+    ],
     {
       cwd: PROJECT_ROOT,
       windowsHide: true,
@@ -110,21 +132,31 @@ async function ensurePythonDaemonRunning(daemonToken) {
     }
   );
 
-  for (let attempt = 0; attempt < 40; attempt += 1) {
+  for (let attempt = 0; attempt < DAEMON_BOOT_MAX_ATTEMPTS; attempt += 1) {
     if (await isDaemonHealthyAndAuthenticated(daemonToken)) {
       return;
     }
-    await new Promise((r) => setTimeout(r, 200));
+    await new Promise((r) => setTimeout(r, DAEMON_BOOT_POLL_MS));
   }
 }
 
 function stopPythonDaemon() {
-  if (daemonProcess && !daemonProcess.killed) {
-    try {
-      daemonProcess.kill();
-    } catch (_err) {
-      // Игнорируем ошибку при завершении дочернего процесса
+  if (!daemonProcess) {
+    return;
+  }
+  const pid = daemonProcess.pid;
+  try {
+    if (pid && process.platform === 'win32') {
+      execFileSync('taskkill', ['/PID', String(pid), '/T', '/F'], {
+        windowsHide: true,
+        stdio: 'ignore',
+      });
+    } else if (!daemonProcess.killed) {
+      daemonProcess.kill('SIGTERM');
     }
+  } catch (_err) {
+    // Дочернее дерево процессов уже завершено
+  } finally {
     daemonProcess = null;
   }
 }
@@ -157,6 +189,33 @@ async function createMainWindow() {
     },
   });
 
+  const distIndex = path.join(__dirname, '..', 'dist', 'index.html');
+  const forceDev = process.env.LGRAPH_DEV === '1';
+  const allowedDistHref = pathToFileURL(distIndex).href;
+
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+
+  mainWindow.webContents.on('will-navigate', (event, navigationUrl) => {
+    try {
+      const parsedNav = new URL(navigationUrl);
+      if (!forceDev && fs.existsSync(distIndex)) {
+        const allowedParsed = new URL(allowedDistHref);
+        const sameFile =
+          process.platform === 'win32'
+            ? parsedNav.pathname.toLowerCase() === allowedParsed.pathname.toLowerCase()
+            : parsedNav.pathname === allowedParsed.pathname;
+        if (parsedNav.protocol === 'file:' && sameFile) {
+          return;
+        }
+      } else if (parsedNav.origin === DEV_SERVER_URL) {
+        return;
+      }
+    } catch (_err) {
+      // Некорректный URL блокируется ниже
+    }
+    event.preventDefault();
+  });
+
   mainWindow.webContents.on('did-start-loading', () => {
     isRendererReady = false;
   });
@@ -165,13 +224,10 @@ async function createMainWindow() {
     mainWindow = null;
   });
 
-  const distIndex = path.join(__dirname, '..', 'dist', 'index.html');
-  const forceDev = process.env.LGRAPH_DEV === '1';
-
   if (!forceDev && fs.existsSync(distIndex)) {
     await mainWindow.loadFile(distIndex);
   } else {
-    await mainWindow.loadURL('http://127.0.0.1:5179');
+    await mainWindow.loadURL(DEV_SERVER_URL);
   }
 }
 
@@ -197,6 +253,17 @@ if (!gotSingleInstanceLock) {
   });
 
   app.whenReady().then(async () => {
+    if (process.env.LGRAPH_DEV !== '1') {
+      session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+        callback({
+          responseHeaders: {
+            ...details.responseHeaders,
+            'Content-Security-Policy': [APP_CSP],
+          },
+        });
+      });
+    }
+
     const daemonToken = initializeDaemonToken(RUNTIME_DIR);
     registerIpcGateway({
       daemonBaseUrl: DAEMON_BASE_URL,

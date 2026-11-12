@@ -61,7 +61,11 @@ class ContextPackRequest(BaseModel):
     token_budget: int = Field(default=DEFAULT_TOKEN_BUDGET, ge=400, le=12000)
 
 
-def create_lgraph_app(runtime_dir: Path | None = None, enable_watchers_default: bool = True) -> FastAPI:
+def create_lgraph_app(
+    runtime_dir: Path | None = None,
+    enable_watchers_default: bool = True,
+    allow_testserver: bool = False,
+) -> FastAPI:
     """Создаёт и настраивает экземпляр локального сервера Lgraph."""
     actual_runtime = runtime_dir or get_default_runtime_dir()
     db_path = actual_runtime / "lgraph.sqlite3"
@@ -82,7 +86,7 @@ def create_lgraph_app(runtime_dir: Path | None = None, enable_watchers_default: 
         lifespan=lifespan,
     )
 
-    app.add_middleware(LocalPerimeterMiddleware, expected_token=token)
+    app.add_middleware(LocalPerimeterMiddleware, expected_token=token, allow_testserver=allow_testserver)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://127.0.0.1:5179", "http://localhost:5179"],
@@ -105,7 +109,10 @@ def create_lgraph_app(runtime_dir: Path | None = None, enable_watchers_default: 
         if enable_watchers_default:
             watcher_mgr.ensure_watching(project_id, root)
         if is_project_disk_dirty(root, repo, project_id):
-            index_project_directory(root, repo)
+            try:
+                index_project_directory(root, repo)
+            except (ValueError, FileNotFoundError) as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
         return proj, root
 
     @app.get("/api/health")
@@ -124,7 +131,10 @@ def create_lgraph_app(runtime_dir: Path | None = None, enable_watchers_default: 
         except (ValueError, FileNotFoundError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        index_report = index_project_directory(safe_root, repo)
+        try:
+            index_report = index_project_directory(safe_root, repo)
+        except (ValueError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         project_id = str(index_report["project_id"])
         if enable_watchers_default and payload.enable_watcher:
             watcher_mgr.ensure_watching(project_id, safe_root)
@@ -141,7 +151,10 @@ def create_lgraph_app(runtime_dir: Path | None = None, enable_watchers_default: 
             root = validate_safe_project_root(proj["root_path"])
         except (ValueError, FileNotFoundError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        index_report = index_project_directory(root, repo)
+        try:
+            index_report = index_project_directory(root, repo)
+        except (ValueError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         if enable_watchers_default:
             watcher_mgr.ensure_watching(project_id, root)
         return {
@@ -207,36 +220,45 @@ def create_lgraph_app(runtime_dir: Path | None = None, enable_watchers_default: 
     @app.post("/api/projects/{project_id}/notes")
     def save_node_note(project_id: str, payload: SaveNoteRequest) -> dict[str, Any]:
         _require_project(project_id)
-        queries.save_architectural_note(
-            project_id=project_id,
-            target_uri=payload.target_uri,
-            summary_ru=payload.summary_ru,
-            risk_level=payload.risk_level,
-        )
+        try:
+            queries.save_architectural_note(
+                project_id=project_id,
+                target_uri=payload.target_uri,
+                summary_ru=payload.summary_ru,
+                risk_level=payload.risk_level,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {"ok": True, "node": queries.get_node_by_uri(project_id, payload.target_uri)}
 
     @app.post("/api/projects/{project_id}/impact")
     def calculate_impact(project_id: str, payload: ImpactRequest) -> dict[str, Any]:
         _, root = _ensure_project_fresh(project_id)
-        return analyze_change_impact(
-            project_id=project_id,
-            project_root=root,
-            query_service=queries,
-            target_uris_or_paths=payload.target_uris_or_paths,
-            git_diff_text=payload.git_diff_text,
-        )
+        try:
+            return analyze_change_impact(
+                project_id=project_id,
+                project_root=root,
+                query_service=queries,
+                target_uris_or_paths=payload.target_uris_or_paths,
+                git_diff_text=payload.git_diff_text,
+            )
+        except (ValueError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/api/projects/{project_id}/guardrails")
     def verify_guardrails(project_id: str) -> dict[str, Any]:
         _, root = _ensure_project_fresh(project_id)
         nodes, edges = queries.get_all_graph_raw(project_id)
         rules = queries.get_guardrail_rules(project_id)
-        violations = evaluate_project_guardrails(
-            project_root=root,
-            nodes=nodes,
-            edges=edges,
-            configured_rules=rules,
-        )
+        try:
+            violations = evaluate_project_guardrails(
+                project_root=root,
+                nodes=nodes,
+                edges=edges,
+                configured_rules=rules,
+            )
+        except (ValueError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {
             "rules": [dataclasses.asdict(r) for r in rules],
             "violations": [dataclasses.asdict(v) for v in violations],
@@ -246,13 +268,16 @@ def create_lgraph_app(runtime_dir: Path | None = None, enable_watchers_default: 
     @app.post("/api/projects/{project_id}/context-pack")
     def generate_context_pack(project_id: str, payload: ContextPackRequest) -> dict[str, Any]:
         _, root = _ensure_project_fresh(project_id)
-        return build_context_pack_markdown(
-            project_id=project_id,
-            query_service=queries,
-            focus_query_or_paths=payload.focus_queries,
-            token_budget=payload.token_budget,
-            project_root=root,
-        )
+        try:
+            return build_context_pack_markdown(
+                project_id=project_id,
+                query_service=queries,
+                focus_query_or_paths=payload.focus_queries,
+                token_budget=payload.token_budget,
+                project_root=root,
+            )
+        except (ValueError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     return app
 

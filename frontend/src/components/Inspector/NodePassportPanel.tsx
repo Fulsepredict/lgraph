@@ -5,10 +5,10 @@
  * 1. Вкладка «Простым языком» открыта по умолчанию: показывает светофор риска,
  *    обучающую карточку IT-паттерна без жаргона и даёт сохранить свою заметку.
  * 2. Вкладка «Техпаспорт» даёт точные пути, строки, сигнатуры, переходы по связям
- *    и кнопку открытия файла в редакторе.
+ *    и кнопку показа файла или папки модуля в Проводнике.
  */
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   ArrowLeftRight,
   BookOpen,
@@ -19,7 +19,9 @@ import {
 } from 'lucide-react';
 import { useGraphStore } from '../../store/useGraphStore';
 import { cleanHumanDocText } from '../../services/api';
-import type { RiskLevel } from '../../types/graph';
+import type { GraphNodeDto, RiskLevel } from '../../types/graph';
+
+const SAVED_TOAST_DURATION_MS = 2200;
 
 const RISK_EXPLANATIONS: Record<RiskLevel, { badge: string; desc: string }> = {
   critical: {
@@ -36,6 +38,18 @@ const RISK_EXPLANATIONS: Record<RiskLevel, { badge: string; desc: string }> = {
   },
 };
 
+function isDirectoryTargetNode(node: GraphNodeDto): boolean {
+  if (node.meta?.target_kind === 'directory') return true;
+  if (node.meta?.target_kind === 'file') return false;
+  if (node.c4_level !== 3 && node.node_type !== 'DomainModule') {
+    return false;
+  }
+  const norm = (node.rel_path || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+  if (!norm) return false;
+  const isRootFileWithExtension = !norm.includes('/') && /^[^/.][^/]*\.[a-z0-9]+$/i.test(norm);
+  return !isRootFileWithExtension;
+}
+
 export function NodePassportPanel() {
   const {
     selectedNode,
@@ -48,14 +62,25 @@ export function NodePassportPanel() {
   const [noteText, setNoteText] = useState('');
   const [riskChoice, setRiskChoice] = useState<RiskLevel>('low');
   const [savedToast, setSavedToast] = useState(false);
+  const [openError, setOpenError] = useState<string | null>(null);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     if (selectedNode) {
       setNoteText(cleanHumanDocText(selectedNode.summary_ru));
       setRiskChoice(selectedNode.risk_level || 'low');
       setSavedToast(false);
+      setOpenError(null);
     }
   }, [selectedNode]);
+
+  useEffect(() => {
+    return () => {
+      if (toastTimerRef.current) {
+        clearTimeout(toastTimerRef.current);
+      }
+    };
+  }, []);
 
   if (!selectedNode) {
     return null;
@@ -64,20 +89,37 @@ export function NodePassportPanel() {
   const riskInfo = RISK_EXPLANATIONS[selectedNode.risk_level] ?? RISK_EXPLANATIONS.low;
   const inbound = selectedNode.inbound_edges ?? [];
   const outbound = selectedNode.outbound_edges ?? [];
+  const isFolderTarget = isDirectoryTargetNode(selectedNode);
 
   const handleSaveNote = async () => {
-    await saveNoteForSelectedNode(noteText, riskChoice);
-    setSavedToast(true);
-    setTimeout(() => setSavedToast(false), 2200);
+    const ok = await saveNoteForSelectedNode(noteText, riskChoice);
+    if (ok) {
+      setSavedToast(true);
+      if (toastTimerRef.current) {
+        clearTimeout(toastTimerRef.current);
+      }
+      toastTimerRef.current = setTimeout(() => setSavedToast(false), SAVED_TOAST_DURATION_MS);
+    } else {
+      setSavedToast(false);
+    }
   };
 
   const handleOpenInEditor = async () => {
     const rootPath = activeStats?.project?.root_path;
-    if (rootPath && selectedNode.rel_path) {
-      await window.lgraphBridge?.openFileInEditor({
+    if (!rootPath || !selectedNode.rel_path) {
+      return;
+    }
+    setOpenError(null);
+    try {
+      const res = await window.lgraphBridge?.openFileInEditor({
         rootPath,
         relPath: selectedNode.rel_path,
       });
+      if (res && !res.ok) {
+        setOpenError('Не удалось открыть расположение в Проводнике.');
+      }
+    } catch (err) {
+      setOpenError(err instanceof Error ? err.message : String(err));
     }
   };
 
@@ -200,7 +242,7 @@ export function NodePassportPanel() {
           </>
         ) : (
           <>
-            {/* Точные координаты файла и переход в IDE */}
+            {/* Точные координаты файла или папки модуля и переход в Проводник */}
             <div className="p-3 rounded-xl bg-[#0E0E10] border border-zinc-800 space-y-2">
               <div className="text-[10px] uppercase text-zinc-500">Канонический URI</div>
               <div className="text-[11px] font-mono text-zinc-200 break-all">{selectedNode.uri}</div>
@@ -214,12 +256,18 @@ export function NodePassportPanel() {
                   <button
                     type="button"
                     onClick={handleOpenInEditor}
-                    title="Показать файл в Проводнике"
+                    title={isFolderTarget ? 'Показать папку в Проводнике' : 'Показать файл в Проводнике'}
                     className="shrink-0 flex items-center gap-1 px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-[11px] text-zinc-100 transition"
                   >
                     <ExternalLink className="w-3 h-3" />
-                    Показать файл
+                    {isFolderTarget ? 'Показать папку' : 'Показать файл'}
                   </button>
+                </div>
+              )}
+
+              {openError && (
+                <div className="text-[11px] text-rose-400 break-words pt-1">
+                  {openError}
                 </div>
               )}
 

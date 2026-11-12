@@ -2,7 +2,7 @@
   "name": "lgraph-desktop",
   "private": true,
   "type": "module",
-  "version": "2.4.0",
+  "version": "2.4.1",
   "description": "Lgraph — Architecture, Contract & Context Intelligence Platform",
   "main": "electron/main.cjs",
   "scripts": {

@@ -15,7 +15,7 @@ from typing import Any
 
 from backend.analyzers.guardrail_engine.evaluator import filter_rules_for_paths
 from backend.core.config import DEFAULT_TOKEN_BUDGET, MAX_TOKEN_BUDGET
-from backend.core.models import normalize_rel_path, to_project_rel_path
+from backend.core.models import normalize_rel_path, redact_inline_secrets, to_project_rel_path
 from backend.storage.queries import GraphQueryService
 
 
@@ -59,7 +59,9 @@ def _personalized_pagerank(
 
     scores = dict(teleport)
     for _ in range(iterations):
-        next_scores = {u: (1.0 - damping) * teleport[u] for u in node_uris}
+        dangling_sum = sum(scores[u] for u, nb in adj.items() if not nb)
+        base_mass = (1.0 - damping) + damping * dangling_sum
+        next_scores = {u: base_mass * teleport[u] for u in node_uris}
         for u, neighbors in adj.items():
             if not neighbors:
                 continue
@@ -196,16 +198,20 @@ def build_context_pack_markdown(
         matched_notes = [
             nt
             for nt in saved_notes
-            if not queries
-            or nt["target_uri"] in seed_uris
-            or nt["target_uri"] in focused_c3_uris
-            or (nt.get("rel_path") and nt["rel_path"] in seed_paths)
+            if str(nt.get("summary_ru") or "").strip()
+            and (
+                not queries
+                or nt["target_uri"] in seed_uris
+                or nt["target_uri"] in focused_c3_uris
+                or (nt.get("rel_path") and nt["rel_path"] in seed_paths)
+            )
         ]
         if matched_notes:
             lines.append("\n## SAVED ARCHITECTURAL NOTES (HUMAN & AI MEMORY)")
             for nt in matched_notes[:8]:
                 rk = f" [{str(nt['note_risk_level']).upper()}]" if nt.get("note_risk_level") else ""
-                lines.append(f"- `{nt['target_uri']}` ({nt['name']}){rk}: {nt['summary_ru']}")
+                safe_note = redact_inline_secrets(str(nt.get("summary_ru") or "").strip())[0]
+                lines.append(f"- `{nt['target_uri']}` ({nt['name']}){rk}: {safe_note}")
 
     # 3. Межъязыковые мосты (`Frontend <-> IPC <-> Backend`)
     if relevant_bridges:

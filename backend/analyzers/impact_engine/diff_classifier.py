@@ -1,11 +1,11 @@
 """
-Классификатор контрактных и внутренних правок (`signature_hash` vs `body_hash`) по `git show HEAD`.
+Классификатор контрактных и внутренних правок (`signature_hash` vs `body_hash`) по `git cat-file --batch`.
 
-Почему это важно для ИИ-агентов и владельца проекта:
-Если разработчик или ИИ ускорил цикл внутри функции, меняется только `body_hash`,
-а внешний контракт (`signature_hash`: имя, аргументы, возвращаемый тип и декоратор маршрута)
-остаётся нетронутым. Если же изменилась сигнатура или удалена функция — модуль явно
-помечает это в `signature_changes`, предупреждая о риске поломки вызывающего кода.
+Почему используется единый пакетный процесс `git cat-file --batch`:
+1. Поштучный спавн `git show HEAD:<path>` на крупных диффах порождал бы сотни подпроцессов Windows.
+   Один конвейерный запрос по `stdin`/`stdout` читает до `200` блобов `HEAD` за единицы миллисекунд.
+2. Если изменилась только реализация цикла (`body_hash`), внешний контракт (`signature_hash`) чист;
+   при изменении сигнатуры или удалении функции модуль фиксирует риск поломки потребителей.
 """
 
 from __future__ import annotations
@@ -19,6 +19,10 @@ from backend.analyzers.code_graph.ts_js_parser import parse_js_ts_file
 from backend.analyzers.code_graph.ts_python_parser import parse_python_file
 from backend.core.models import GraphNodeRecord, NodeType, RiskLevel
 
+MAX_BATCH_DIFF_FILES: int = 200
+GIT_HEAD_CHECK_TIMEOUT_SEC: float = 2.5
+GIT_BATCH_CAT_TIMEOUT_SEC: float = 8.0
+
 
 def _has_git_head(project_root: Path) -> bool:
     if not (project_root / ".git").exists():
@@ -28,7 +32,7 @@ def _has_git_head(project_root: Path) -> bool:
             ["git", "rev-parse", "--verify", "HEAD"],
             cwd=str(project_root),
             capture_output=True,
-            timeout=2.5,
+            timeout=GIT_HEAD_CHECK_TIMEOUT_SEC,
             check=False,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
@@ -37,21 +41,54 @@ def _has_git_head(project_root: Path) -> bool:
         return False
 
 
-def _read_git_head_bytes(project_root: Path, rel_path: str) -> bytes | None:
+def _read_git_head_blobs_batch(project_root: Path, rel_paths: list[str]) -> dict[str, bytes | None] | None:
+    """Читает блобы `HEAD:<rel_path>` для пакета файлов за один вызов `git cat-file --batch`."""
+    if not rel_paths:
+        return {}
+    stdin_payload = "".join(f"HEAD:{rp}\n" for rp in rel_paths).encode("utf-8")
     try:
         proc = subprocess.run(
-            ["git", "show", f"HEAD:{rel_path}"],
+            ["git", "cat-file", "--batch"],
             cwd=str(project_root),
+            input=stdin_payload,
             capture_output=True,
-            timeout=3.0,
+            timeout=GIT_BATCH_CAT_TIMEOUT_SEC,
             check=False,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-        if proc.returncode == 0:
-            return proc.stdout
     except Exception:
-        pass
-    return None
+        return None
+    if proc.returncode != 0:
+        return None
+
+    raw = proc.stdout
+    total = len(raw)
+    pos = 0
+    blobs: dict[str, bytes | None] = {}
+    for rp in rel_paths:
+        nl = raw.find(b"\n", pos)
+        if nl < 0:
+            return None
+        header = raw[pos:nl]
+        pos = nl + 1
+        if header.endswith((b" missing", b" ambiguous")):
+            blobs[rp] = None
+            continue
+        parts = header.rsplit(b" ", 2)
+        if len(parts) != 3:
+            return None
+        try:
+            size = int(parts[2])
+        except ValueError:
+            return None
+        if pos + size > total:
+            return None
+        body = raw[pos : pos + size]
+        pos += size
+        if pos < total and raw[pos : pos + 1] == b"\n":
+            pos += 1
+        blobs[rp] = body if parts[1] == b"blob" else None
+    return blobs
 
 
 def _parse_symbols_in_memory(rel_path: str, raw_bytes: bytes) -> dict[str, GraphNodeRecord]:
@@ -87,16 +124,25 @@ def classify_symbol_changes_vs_git_head(
         if rp in touched_rel_paths and nd.get("node_type") in ("Function", "Class", "DataContract", "Test"):
             curr_by_rel.setdefault(rp, {})[str(nd["uri"])] = nd
 
+    supported_exts = PY_EXTENSIONS | JS_TS_EXTENSIONS
+    candidate_paths = [
+        rp
+        for rp in sorted(touched_rel_paths)
+        if "\n" not in rp and "\r" not in rp and Path(rp).suffix.lower() in supported_exts
+    ][:MAX_BATCH_DIFF_FILES]
+    if not candidate_paths:
+        return [], []
+
+    head_blobs = _read_git_head_blobs_batch(project_root, candidate_paths)
+    if head_blobs is None:
+        return [], []
+
     signature_changes: list[dict[str, Any]] = []
     body_only_changes: list[dict[str, Any]] = []
 
-    for rel_path in sorted(touched_rel_paths):
-        ext = Path(rel_path).suffix.lower()
-        if ext not in PY_EXTENSIONS and ext not in JS_TS_EXTENSIONS:
-            continue
-
+    for rel_path in candidate_paths:
         curr_syms = curr_by_rel.get(rel_path, {})
-        head_bytes = _read_git_head_bytes(project_root, rel_path)
+        head_bytes = head_blobs.get(rel_path)
 
         # Новый файл, которого ещё не было в HEAD
         if head_bytes is None:

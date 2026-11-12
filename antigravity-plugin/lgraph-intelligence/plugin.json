@@ -1,7 +1,7 @@
 {
   "name": "lgraph-intelligence",
   "displayName": "Lgraph Intelligence",
-  "version": "2.4.0",
+  "version": "2.4.1",
   "author": "Lgraph Open Source",
   "description": "Локальный архитектурный радар Lgraph: 6 инструментов MCP, сжатие контекста по PageRank, сшивка мостов Frontend-IPC-Backend и машинные правила Guardrails.",
   "logo": "assets/logo.png",

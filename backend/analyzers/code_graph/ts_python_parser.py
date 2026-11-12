@@ -35,7 +35,7 @@ _PY_PARSE_LOCK = threading.Lock()
 
 _FASTAPI_HTTP_METHODS: frozenset[str] = frozenset({"get", "post", "put", "delete", "patch"})
 _ROUTER_PREFIX_RE = re.compile(
-    r"""include_router\(\s*([A-Za-z_][A-Za-z0-9_]*)(?:[^)]*?prefix\s*=\s*['"]([^'"]+)['"])?""",
+    r"""include_router\(\s*([A-Za-z_][A-Za-z0-9_.]*)(?:[^)]*?prefix\s*=\s*['"]([^'"]+)['"])?""",
     re.DOTALL,
 )
 _API_ROUTER_DEF_RE = re.compile(
@@ -102,7 +102,7 @@ def _collect_calls_in_subtree(root: Node, caller_uri: str, source_bytes: bytes, 
         if cur.type == "call":
             fn_node = cur.child_by_field_name("function")
             if fn_node is not None:
-                fn_txt = _node_text(fn_node, source_bytes).strip()
+                fn_txt, _ = redact_inline_secrets(_node_text(fn_node, source_bytes).strip())
                 if fn_txt and len(fn_txt) <= 120:
                     out_calls.append((caller_uri, fn_txt))
         stack.extend(_named_children(cur))
@@ -140,11 +140,16 @@ def parse_python_file(rel_path: str, source_bytes: bytes, file_risk: RiskLevel) 
         if child.type == "import_statement":
             for name_node in _named_children(child):
                 raw_imp = _node_text(name_node, source_bytes).strip()
-                mod_name = raw_imp.split(" as ", 1)[0].strip()
+                parts_as = [p.strip() for p in raw_imp.split(" as ", 1)]
+                mod_name = parts_as[0]
                 if mod_name:
                     result.imports.append((mod_name, []))
+                    bound_nm = parts_as[1] if len(parts_as) == 2 and parts_as[1] else mod_name
+                    imported_symbol_origins[bound_nm] = f"{mod_name}:"
         elif child.type == "import_from_statement":
-            mod_node = child.child_by_field_name("module_name")
+            mod_node = child.child_by_field_name("module_name") or next(
+                (c for c in _named_children(child) if c.type == "relative_import"), None
+            )
             mod_name = _node_text(mod_node, source_bytes).strip()
             names: list[str] = []
             for sub in _named_children(child):
@@ -188,8 +193,19 @@ def parse_python_file(rel_path: str, source_bytes: bytes, file_risk: RiskLevel) 
         router_var = match.group(1)
         prefix = match.group(2) or ""
         origin = imported_symbol_origins.get(router_var, "")
+        if not origin and "." in router_var:
+            head_var, tail_attr = router_var.rsplit(".", 1)
+            base_origin = imported_symbol_origins.get(head_var) or imported_symbol_origins.get(router_var.split(".", 1)[0], "")
+            if ":" in base_origin:
+                b_mod, b_sym = base_origin.split(":", 1)
+                if not b_sym:
+                    origin = f"{b_mod}:{tail_attr}"
+                elif not b_mod.strip("."):
+                    origin = f"{b_mod}:{b_sym}"
+                else:
+                    origin = f"{b_mod}.{b_sym}:{tail_attr}"
         result.router_includes.append(
-            {"router_var": router_var, "prefix": prefix, "imported_from": origin}
+            {"router_var": router_var, "prefix": prefix, "imported_from": origin, "importer_rel_path": rel_path}
         )
 
     return result

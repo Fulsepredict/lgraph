@@ -103,17 +103,25 @@ export interface GuardrailsReportDto {
 
 export interface ImpactReportDto {
   touched_files: string[];
+  unmatched_targets?: string[];
+  auto_reindexed_from_disk?: boolean;
   modified_c3_uris: string[];
   impacted_c3_uris: string[];
   direct_dependents: Array<{ uri: string; name: string; rel_path: string }>;
   indirect_dependents: Array<{ uri: string; name: string; rel_path: string }>;
-  cross_language_impacts: Array<{ changed_uri: string; impacted_uri: string; via: string }>;
+  cross_language_impacts: Array<{
+    changed_uri: string;
+    impacted_uri: string;
+    direction?: string;
+    via: string;
+  }>;
   signature_changes?: Array<{
     uri: string;
     name: string;
     rel_path: string;
-    old_signature: string;
-    new_signature: string;
+    change_kind?: string;
+    old_signature?: string;
+    new_signature?: string;
   }>;
   body_only_changes?: Array<{ uri: string; name: string; rel_path: string }>;
   related_tests: Array<{ uri: string; name: string; rel_path: string }>;

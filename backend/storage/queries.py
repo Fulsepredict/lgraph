@@ -14,8 +14,8 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
-from backend.core.models import GuardrailRuleSpec
-from backend.storage.repository import utc_now_iso
+from backend.core.models import GuardrailRuleSpec, redact_inline_secrets
+from backend.storage.repository import begin_immediate_transaction, utc_now_iso
 from backend.storage.schema import open_sqlite_connection
 
 
@@ -217,34 +217,48 @@ class GraphQueryService:
         summary_ru: str,
         risk_level: str = "",
     ) -> None:
+        clean_summary, _ = redact_inline_secrets(summary_ru.strip())
+        clean_risk = risk_level.strip()
         now_iso = utc_now_iso()
         with closing(open_sqlite_connection(self.db_path)) as conn:
-            with conn:
+            with begin_immediate_transaction(conn):
+                existing = conn.execute(
+                    "SELECT risk_level FROM architectural_notes WHERE project_id = ? AND target_uri = ?",
+                    (project_id, target_uri),
+                ).fetchone()
+                effective_risk = clean_risk or (str(existing["risk_level"]) if existing else "")
+
+                if not clean_summary and not effective_risk:
+                    conn.execute(
+                        "DELETE FROM architectural_notes WHERE project_id = ? AND target_uri = ?",
+                        (project_id, target_uri),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO architectural_notes (project_id, target_uri, summary_ru, risk_level, updated_at_iso)
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(project_id, target_uri) DO UPDATE SET
+                            summary_ru = excluded.summary_ru,
+                            risk_level = excluded.risk_level,
+                            updated_at_iso = excluded.updated_at_iso
+                        """,
+                        (project_id, target_uri, clean_summary, effective_risk, now_iso),
+                    )
+
+                # Всегда синхронно обновляем (или очищаем при пустом тексте) заметку в узлах и FTS5
                 conn.execute(
-                    """
-                    INSERT INTO architectural_notes (project_id, target_uri, summary_ru, risk_level, updated_at_iso)
-                    VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(project_id, target_uri) DO UPDATE SET
-                        summary_ru = excluded.summary_ru,
-                        risk_level = CASE WHEN excluded.risk_level != '' THEN excluded.risk_level ELSE architectural_notes.risk_level END,
-                        updated_at_iso = excluded.updated_at_iso
-                    """,
-                    (project_id, target_uri, summary_ru.strip(), risk_level.strip(), now_iso),
+                    "UPDATE nodes SET summary_ru = ? WHERE project_id = ? AND uri = ?",
+                    (clean_summary, project_id, target_uri),
                 )
-                if summary_ru.strip():
-                    conn.execute(
-                        "UPDATE nodes SET summary_ru = ? WHERE project_id = ? AND uri = ?",
-                        (summary_ru.strip(), project_id, target_uri),
-                    )
-                    # Мгновенно синхронизируем полнотекстовый индекс FTS5 без ожидания полной переиндексации
-                    conn.execute(
-                        "UPDATE nodes_fts SET summary_ru = ? WHERE project_id = ? AND uri = ?",
-                        (summary_ru.strip(), project_id, target_uri),
-                    )
-                if risk_level.strip():
+                conn.execute(
+                    "UPDATE nodes_fts SET summary_ru = ? WHERE project_id = ? AND uri = ?",
+                    (clean_summary, project_id, target_uri),
+                )
+                if clean_risk:
                     conn.execute(
                         "UPDATE nodes SET risk_level = ? WHERE project_id = ? AND uri = ?",
-                        (risk_level.strip(), project_id, target_uri),
+                        (clean_risk, project_id, target_uri),
                     )
 
     def get_architectural_notes(self, project_id: str) -> list[dict[str, Any]]:
@@ -263,7 +277,7 @@ class GraphQueryService:
                     COALESCE(n.c4_level, 4) AS c4_level
                 FROM architectural_notes a
                 LEFT JOIN nodes n ON n.project_id = a.project_id AND n.uri = a.target_uri
-                WHERE a.project_id = ?
+                WHERE a.project_id = ? AND a.summary_ru != ''
                 ORDER BY c4_level ASC, a.updated_at_iso DESC
                 """,
                 (project_id,),

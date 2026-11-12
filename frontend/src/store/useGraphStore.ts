@@ -28,9 +28,10 @@ import type {
   RiskLevel,
 } from '../types/graph';
 
-// Защита от двойного монтирования React 18 <StrictMode> и гонок параллельных переключений проектов
+// Счётчики поколений исключают гонки при быстром переключении проектов и карточек узлов
 let activeBootPromise: Promise<void> | null = null;
 let latestProjectLoadSeq = 0;
+let latestNodeSelectSeq = 0;
 
 interface GraphUiState {
   projects: ProjectRecord[];
@@ -57,7 +58,7 @@ interface GraphUiState {
   reindexActiveProject: () => Promise<void>;
   setC4Level: (level: number) => Promise<void>;
   selectNodeByUri: (uri: string | null) => Promise<void>;
-  saveNoteForSelectedNode: (summaryRu: string, riskLevel: RiskLevel) => Promise<void>;
+  saveNoteForSelectedNode: (summaryRu: string, riskLevel: RiskLevel) => Promise<boolean>;
   toggleDiffRadar: () => Promise<void>;
   toggleHealthRadar: () => void;
   setSearchQuery: (q: string) => void;
@@ -85,21 +86,17 @@ export const useGraphStore = create<GraphUiState>((set, get) => ({
   errorMessage: null,
 
   bootInitialProjects: async () => {
-    if (activeBootPromise) {
-      return activeBootPromise;
-    }
+    if (activeBootPromise) return activeBootPromise;
     activeBootPromise = (async () => {
       try {
         const startupCtx = await window.lgraphBridge?.getStartupContext().catch(() => null);
-        if (startupCtx?.selfRootPath) {
-          set({ selfRootPath: startupCtx.selfRootPath });
-        }
+        if (startupCtx?.selfRootPath) set({ selfRootPath: startupCtx.selfRootPath });
         if (startupCtx?.initialProjectDir) {
           await get().openProjectByPath(startupCtx.initialProjectDir);
           return;
         }
         const { projects } = await fetchOpenedProjects();
-        set({ projects });
+        if (latestProjectLoadSeq === 0) set({ projects });
         if (projects.length > 0 && !get().activeProjectId && latestProjectLoadSeq === 0) {
           await get().selectExistingProject(projects[0].project_id);
         }
@@ -112,18 +109,18 @@ export const useGraphStore = create<GraphUiState>((set, get) => ({
 
   openProjectByPath: async (rootPath: string) => {
     const reqSeq = ++latestProjectLoadSeq;
+    ++latestNodeSelectSeq;
     set({ isLoading: true, errorMessage: null });
     try {
       const { index_report, stats } = await openAndIndexProject(rootPath);
+      if (reqSeq !== latestProjectLoadSeq) return;
       const pid = index_report.project_id;
       const [{ projects }, mapData, guardrails] = await Promise.all([
         fetchOpenedProjects(),
         fetchArchitectureMap(pid, get().c4Level),
         fetchGuardrailsReport(pid),
       ]);
-      if (reqSeq !== latestProjectLoadSeq) {
-        return;
-      }
+      if (reqSeq !== latestProjectLoadSeq) return;
       set({
         projects,
         activeProjectId: pid,
@@ -138,28 +135,23 @@ export const useGraphStore = create<GraphUiState>((set, get) => ({
         isLoading: false,
       });
     } catch (err) {
-      if (reqSeq !== latestProjectLoadSeq) {
-        return;
-      }
-      set({
-        isLoading: false,
-        errorMessage: err instanceof Error ? err.message : String(err),
-      });
+      if (reqSeq !== latestProjectLoadSeq) return;
+      set({ isLoading: false, errorMessage: err instanceof Error ? err.message : String(err) });
     }
   },
 
   selectExistingProject: async (projectId: string) => {
     const reqSeq = ++latestProjectLoadSeq;
+    ++latestNodeSelectSeq;
     set({ isLoading: true, errorMessage: null });
     try {
       const { index_report, stats } = await triggerProjectReindex(projectId);
+      if (reqSeq !== latestProjectLoadSeq) return;
       const [mapData, guardrails] = await Promise.all([
         fetchArchitectureMap(projectId, get().c4Level),
         fetchGuardrailsReport(projectId),
       ]);
-      if (reqSeq !== latestProjectLoadSeq) {
-        return;
-      }
+      if (reqSeq !== latestProjectLoadSeq) return;
       set({
         activeProjectId: projectId,
         activeStats: stats,
@@ -173,27 +165,26 @@ export const useGraphStore = create<GraphUiState>((set, get) => ({
         isLoading: false,
       });
     } catch (err) {
-      if (reqSeq !== latestProjectLoadSeq) {
-        return;
-      }
-      set({
-        isLoading: false,
-        errorMessage: err instanceof Error ? err.message : String(err),
-      });
+      if (reqSeq !== latestProjectLoadSeq) return;
+      set({ isLoading: false, errorMessage: err instanceof Error ? err.message : String(err) });
     }
   },
 
   reindexActiveProject: async () => {
     const pid = get().activeProjectId;
     if (!pid) return;
+    const reqSeq = latestProjectLoadSeq;
     set({ isLoading: true, errorMessage: null });
     try {
       const { index_report, stats } = await triggerProjectReindex(pid);
+      if (get().activeProjectId !== pid || latestProjectLoadSeq !== reqSeq) return;
       const [mapData, guardrails] = await Promise.all([
         fetchArchitectureMap(pid, get().c4Level),
         fetchGuardrailsReport(pid),
       ]);
+      if (get().activeProjectId !== pid || latestProjectLoadSeq !== reqSeq) return;
       const impact = get().isDiffRadarActive ? await runVisualAiDiffImpact(pid) : null;
+      if (get().activeProjectId !== pid || latestProjectLoadSeq !== reqSeq) return;
       set({
         activeStats: stats,
         lastIndexReport: index_report,
@@ -204,64 +195,87 @@ export const useGraphStore = create<GraphUiState>((set, get) => ({
         isLoading: false,
       });
     } catch (err) {
-      set({
-        isLoading: false,
-        errorMessage: err instanceof Error ? err.message : String(err),
-      });
+      if (get().activeProjectId !== pid || latestProjectLoadSeq !== reqSeq) return;
+      set({ isLoading: false, errorMessage: err instanceof Error ? err.message : String(err) });
     }
   },
 
   setC4Level: async (level: number) => {
     const pid = get().activeProjectId;
+    const reqSeq = latestProjectLoadSeq;
     set({ c4Level: level });
     if (!pid) return;
     set({ isLoading: true });
     try {
       const mapData = await fetchArchitectureMap(pid, level);
+      if (get().activeProjectId !== pid || latestProjectLoadSeq !== reqSeq || get().c4Level !== level) return;
       set({ mapNodes: mapData.nodes, mapEdges: mapData.edges, isLoading: false });
     } catch (err) {
+      if (get().activeProjectId !== pid || latestProjectLoadSeq !== reqSeq || get().c4Level !== level) return;
       set({ isLoading: false, errorMessage: err instanceof Error ? err.message : String(err) });
     }
   },
 
   selectNodeByUri: async (uri: string | null) => {
     const pid = get().activeProjectId;
+    const reqSeq = latestProjectLoadSeq;
+    const nodeSeq = ++latestNodeSelectSeq;
     if (!pid || !uri) {
       set({ selectedNode: null });
       return;
     }
     try {
       const { node } = await fetchNodePassport(pid, uri);
+      if (get().activeProjectId !== pid || latestProjectLoadSeq !== reqSeq || latestNodeSelectSeq !== nodeSeq) return;
       set({ selectedNode: node });
     } catch (err) {
+      if (get().activeProjectId !== pid || latestProjectLoadSeq !== reqSeq || latestNodeSelectSeq !== nodeSeq) return;
       set({ errorMessage: err instanceof Error ? err.message : String(err) });
     }
   },
 
-  saveNoteForSelectedNode: async (summaryRu: string, riskLevel: RiskLevel) => {
-    const { activeProjectId, selectedNode, c4Level } = get();
-    if (!activeProjectId || !selectedNode) return;
+  saveNoteForSelectedNode: async (summaryRu: string, riskLevel: RiskLevel): Promise<boolean> => {
+    const pid = get().activeProjectId;
+    const targetNode = get().selectedNode;
+    if (!pid || !targetNode) return false;
+    const reqSeq = latestProjectLoadSeq;
+    const targetUri = targetNode.uri;
     try {
-      const { node } = await saveNodeArchitecturalNote(activeProjectId, selectedNode.uri, summaryRu, riskLevel);
-      const mapData = await fetchArchitectureMap(activeProjectId, c4Level);
-      set({ selectedNode: node, mapNodes: mapData.nodes, mapEdges: mapData.edges });
+      const { node } = await saveNodeArchitecturalNote(pid, targetUri, summaryRu, riskLevel);
+      if (get().activeProjectId !== pid || latestProjectLoadSeq !== reqSeq) return false;
+      const currentLevel = get().c4Level;
+      const mapData = await fetchArchitectureMap(pid, currentLevel);
+      if (get().activeProjectId !== pid || latestProjectLoadSeq !== reqSeq) return false;
+      set((state) => ({
+        selectedNode: state.selectedNode?.uri === targetUri ? node : state.selectedNode,
+        mapNodes: state.c4Level === currentLevel ? mapData.nodes : state.mapNodes,
+        mapEdges: state.c4Level === currentLevel ? mapData.edges : state.mapEdges,
+        errorMessage: null,
+      }));
+      return true;
     } catch (err) {
+      if (get().activeProjectId !== pid || latestProjectLoadSeq !== reqSeq) return false;
       set({ errorMessage: err instanceof Error ? err.message : String(err) });
+      return false;
     }
   },
 
   toggleDiffRadar: async () => {
-    const { activeProjectId, isDiffRadarActive } = get();
-    if (!activeProjectId) return;
+    const pid = get().activeProjectId;
+    const isDiffRadarActive = get().isDiffRadarActive;
+    if (!pid) return;
+    const reqSeq = latestProjectLoadSeq;
     if (isDiffRadarActive) {
       set({ isDiffRadarActive: false, impactReport: null });
       return;
     }
     set({ isLoading: true });
     try {
-      const report = await runVisualAiDiffImpact(activeProjectId);
+      const report = await runVisualAiDiffImpact(pid);
+      if (get().activeProjectId !== pid || latestProjectLoadSeq !== reqSeq) return;
       set({ isDiffRadarActive: true, impactReport: report, isLoading: false });
     } catch (err) {
+      if (get().activeProjectId !== pid || latestProjectLoadSeq !== reqSeq) return;
       set({ isLoading: false, errorMessage: err instanceof Error ? err.message : String(err) });
     }
   },

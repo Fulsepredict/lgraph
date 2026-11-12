@@ -19,13 +19,9 @@ from typing import Any
 
 import yaml
 
+from backend.core.config import is_reparse_or_symlink
 from backend.core.models import (
-    ConfidenceTier,
-    EdgeType,
-    GraphEdgeRecord,
-    GraphNodeRecord,
-    NodeType,
-    RiskLevel,
+    ConfidenceTier, EdgeType, GraphEdgeRecord, GraphNodeRecord, NodeType, RiskLevel,
 )
 
 _LEADING_BASE_INTERP_RE = re.compile(
@@ -60,15 +56,82 @@ def normalize_route_mask(raw_url: str, prepend_prefix: str = "") -> str:
 
 
 def load_project_lgraph_config(project_root: Path) -> dict[str, Any]:
-    """Читает опциональный проектный файл `lgraph.yaml` из корня исследуемого проекта."""
+    """
+    Читает проектный файл `lgraph.yaml` в режиме Fail-Closed:
+    если файла нет или он пуст — возвращает `{}`, но при ошибке YAML или неверном корневом типе
+    выбрасывает `ValueError`, чтобы опечатка в отступах не обнулила `BLOCKER`-правила в БД.
+    """
     cfg_path = project_root / "lgraph.yaml"
-    if not cfg_path.is_file():
+    if not cfg_path.exists():
         return {}
+    if is_reparse_or_symlink(cfg_path) or not cfg_path.is_file():
+        raise ValueError(f"Ошибка синтаксиса в файле конфигурации {cfg_path}: недопустимый тип файла или симлинк.")
     try:
-        loaded = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
-        return loaded if isinstance(loaded, dict) else {}
-    except Exception:
+        raw_text = cfg_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValueError(f"Ошибка синтаксиса в файле конфигурации {cfg_path}: {exc}") from exc
+    try:
+        loaded = yaml.safe_load(raw_text)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Ошибка синтаксиса в файле конфигурации {cfg_path}: {exc}") from exc
+    if loaded is None:
         return {}
+    if not isinstance(loaded, dict):
+        raise ValueError(
+            f"Ошибка синтаксиса в файле конфигурации {cfg_path}: корень YAML обязан быть словарём, получен {type(loaded).__name__}."
+        )
+    return loaded
+
+
+def _resolve_router_origin_rel_path(origin: str, importer_rel_path: str = "") -> list[str]:
+    """Разрешает источник роутера (`.routes:router`, `..v1.routes:router`, `.:routes`) в пути `.py` файлов."""
+    if ":" not in origin:
+        return []
+    mod_part, sym_part = [p.strip() for p in origin.split(":", 1)]
+    if not mod_part:
+        return []
+    norm_imp = importer_rel_path.replace("\\", "/").strip("/")
+    imp_dir = [p for p in norm_imp.split("/")[:-1] if p]
+
+    if mod_part.startswith("."):
+        dots = len(mod_part) - len(mod_part.lstrip("."))
+        rem = mod_part[dots:].replace(".", "/").strip("/")
+        tail = rem or sym_part.replace(".", "/").strip("/")
+        if not norm_imp:
+            return [f"{tail}.py", f"{tail}/__init__.py"] if tail else []
+        up = dots - 1
+        if up > len(imp_dir):
+            return []
+        base = "/".join(imp_dir[: len(imp_dir) - up] + ([tail] if tail else []))
+        return [f"{base}.py", f"{base}/__init__.py"] if base else []
+
+    base = mod_part.replace(".", "/").strip("/")
+    if not base:
+        return []
+    cands = [f"{base}.py", f"{base}/__init__.py"]
+    if imp_dir and not base.startswith(imp_dir[0] + "/"):
+        cands.extend([f"{imp_dir[0]}/{base}.py", f"{imp_dir[0]}/{base}/__init__.py"])
+    return cands
+
+
+def _match_http_route(
+    server_endpoints: dict[tuple[str, str], list[str]], method: str, candidate_mask: str
+) -> tuple[str, list[str]]:
+    """Находит точный маршрут либо параметризованный шаблон `{param}` той же длины и HTTP-метода."""
+    exact = server_endpoints.get((method, candidate_mask))
+    if exact:
+        return candidate_mask, exact
+    c_segs = [s for s in candidate_mask.split("/") if s]
+    best_mask, best_targets, best_static = candidate_mask, [], -1
+    for (srv_m, srv_mask), targets in server_endpoints.items():
+        if srv_m != method or "{param}" not in srv_mask:
+            continue
+        s_segs = [s for s in srv_mask.split("/") if s]
+        static_cnt = sum(1 for s in s_segs if s != "{param}")
+        if len(s_segs) == len(c_segs) and static_cnt > best_static and static_cnt >= 1:
+            if all(ss == "{param}" or cs == ss for cs, ss in zip(c_segs, s_segs)):
+                best_mask, best_targets, best_static = srv_mask, targets, static_cnt
+    return best_mask, best_targets
 
 
 def link_cross_language_bridges(
@@ -93,12 +156,16 @@ def link_cross_language_bridges(
 
     # 1. Вычисляем полные префиксы FastAPI роутеров из `app.include_router(router_var, prefix=...)`
     file_router_prefixes: dict[str, list[str]] = {}
+    exact_only_keys: set[str] = set()
     for inc in py_router_includes:
-        origin = inc.get("imported_from", "")  # например `backend.routes_orders:router`
+        origin = inc.get("imported_from", "")
+        importer_rel = inc.get("importer_rel_path", "")
         prefix = inc.get("prefix", "")
-        if ":" in origin:
-            mod_dotted = origin.split(":", 1)[0].replace(".", "/") + ".py"
-            file_router_prefixes.setdefault(mod_dotted, []).append(prefix)
+        for cand_rel in _resolve_router_origin_rel_path(origin, importer_rel):
+            if prefix not in file_router_prefixes.setdefault(cand_rel, []):
+                file_router_prefixes[cand_rel].append(prefix)
+            if importer_rel and origin.startswith("."):
+                exact_only_keys.add(cand_rel)
 
     # 2. Строим таблицу канонических серверных маршрутов `(METHOD, mask) -> [func_uri]`
     server_endpoints: dict[tuple[str, str], list[str]] = {}
@@ -106,7 +173,7 @@ def link_cross_language_bridges(
         matched_prefixes = list(file_router_prefixes.get(rel_py) or [])
         if not matched_prefixes:
             for mod_key, prefs in file_router_prefixes.items():
-                if rel_py.endswith("/" + mod_key):
+                if mod_key not in exact_only_keys and rel_py.endswith("/" + mod_key):
                     matched_prefixes.extend(prefs)
         prefixes = matched_prefixes or [""]
         for rt in routes:
@@ -141,24 +208,17 @@ def link_cross_language_bridges(
             unresolved_node_created = True
             bridge_nodes.append(
                 GraphNodeRecord(
-                    uri=uri,
-                    node_type=NodeType.IPC_CHANNEL,
-                    name="Динамический адрес/канал (Runtime)",
-                    c4_level=4,
-                    risk_level=RiskLevel.MEDIUM,
-                    confidence=0.35,
+                    uri=uri, node_type=NodeType.IPC_CHANNEL, name="Динамический адрес/канал (Runtime)",
+                    c4_level=4, risk_level=RiskLevel.MEDIUM, confidence=0.35, source_module="bridge_linker",
                     summary_ru="Точный адрес или имя канала вычисляется во время работы программы из переменной. Требует ручной проверки.",
-                    source_module="bridge_linker",
                 )
             )
         return uri
 
     # 4. Сопоставляем клиентские HTTP и IPC вызовы с сервером и Electron Main
     for cs in js_call_sites:
-        callee = cs["callee"]
+        callee, arg_raw, arg_type = cs["callee"], cs["first_arg_raw"], cs["first_arg_type"]
         short_callee = callee.rsplit(".", 1)[-1]
-        arg_raw = cs["first_arg_raw"]
-        arg_type = cs["first_arg_type"]
 
         # А) Клиентские IPC вызовы (`ipcRenderer.invoke`, `ipcRenderer.send`)
         if callee in ("ipcRenderer.invoke", "ipcRenderer.send", "electron.ipcRenderer.invoke"):
@@ -225,27 +285,19 @@ def link_cross_language_bridges(
         if arg_type not in ("string", "template_string"):
             continue
 
-        http_method = (
-            axios_match.group(1).upper()
-            if axios_match
-            else (cs["method_hint"] or "GET")
-        )
+        http_method = axios_match.group(1).upper() if axios_match else (cs["method_hint"] or "GET")
         prepend = str(wrapper_cfg.get("prepend_prefix", "")) if wrapper_cfg else ""
-        route_mask = normalize_route_mask(arg_raw, prepend_prefix=prepend)
-        matched_targets = server_endpoints.get((http_method, route_mask), [])
+        route_mask, matched_targets = _match_http_route(
+            server_endpoints, http_method, normalize_route_mask(arg_raw, prepend_prefix=prepend)
+        )
         used_heuristic_prefix = False
         if not matched_targets and is_custom_fetch_name and not wrapper_cfg:
-            alt_mask = normalize_route_mask(arg_raw, prepend_prefix="/api")
-            alt_targets = server_endpoints.get((http_method, alt_mask), [])
+            alt_mask, alt_targets = _match_http_route(
+                server_endpoints, http_method, normalize_route_mask(arg_raw, prepend_prefix="/api")
+            )
             if alt_targets:
-                route_mask = alt_mask
-                matched_targets = alt_targets
-                used_heuristic_prefix = True
-        tier = (
-            ConfidenceTier.PATTERN_MATCHED
-            if ("{param}" in route_mask or used_heuristic_prefix)
-            else ConfidenceTier.EXACT
-        )
+                route_mask, matched_targets, used_heuristic_prefix = alt_mask, alt_targets, True
+        tier = ConfidenceTier.PATTERN_MATCHED if ("{param}" in route_mask or used_heuristic_prefix) else ConfidenceTier.EXACT
         conf = 0.92 if tier == ConfidenceTier.PATTERN_MATCHED else 1.0
 
         for target_fn_uri in matched_targets:

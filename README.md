@@ -1,6 +1,6 @@
 <div align="center">
   <img src="frontend/public/logo.png" alt="Lgraph Logo" width="96" height="96" />
-  <h1>Lgraph v2.4</h1>
+  <h1>Lgraph v2.4.1</h1>
   <p><strong>Visual Architecture Map, Cross-Language Contract Linker & Zero-Bloat MCP Intelligence for AI Coding Agents</strong></p>
   <p><em>Визуальная карта архитектуры, сшиватель межъязыковых контрактов и автономный MCP-сервер сжатия контекста для нейросетей (Antigravity, Cursor, Claude Code)</em></p>
 </div>

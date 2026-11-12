@@ -180,52 +180,95 @@ def format_cmd_launcher_script(start_bat: Path) -> str:
     )
 
 
-def create_desktop_shortcut_and_cli() -> tuple[Path | None, Path | None]:
+def resolve_shortcut_target(project_root: Path) -> tuple[Path, str, Path]:
+    """
+    Выбирает бесконсольный `pythonw.exe` + `scripts/launch_desktop.py`, если окружение и Electron готовы
+    (защита от глобального `ELECTRON_RUN_AS_NODE=1` и 0 мс окна консоли), иначе фоллбэк на `START_APP.bat`.
+    """
+    frontend_dir = project_root / "frontend"
+    electron_exe = frontend_dir / "node_modules" / "electron" / "dist" / "electron.exe"
+    pythonw_exe = project_root / "backend" / "venv" / "Scripts" / "pythonw.exe"
+    launch_py = project_root / "scripts" / "launch_desktop.py"
+    start_bat = project_root / "START_APP.bat"
+
+    if pythonw_exe.is_file() and electron_exe.is_file() and launch_py.is_file():
+        return pythonw_exe, f'"{launch_py}"', frontend_dir
+    return start_bat, "", (frontend_dir if frontend_dir.is_dir() else project_root)
+
+
+SHORTCUT_DESCRIPTION_RU: str = "Lgraph — Визуальная карта архитектуры и контрактов"
+# Скрипт строго в 7-bit ASCII; UTF-8 выставляется до Write-Output, чтобы кириллический путь Desktop
+# (например «Рабочий стол») не кодировался в OEM CP866 и не ломал декодер при PYTHONUTF8=1.
+POWERSHELL_SHORTCUT_SCRIPT: str = (
+    "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+    "$OutputEncoding = [System.Text.Encoding]::UTF8; "
+    "$desk = if ($env:LGRAPH_SC_DESKTOP) { $env:LGRAPH_SC_DESKTOP } "
+    "else { [Environment]::GetFolderPath('Desktop') }; "
+    "$lnkPath = Join-Path $desk 'Lgraph.lnk'; "
+    "$ws = New-Object -ComObject WScript.Shell; "
+    "$sc = $ws.CreateShortcut($lnkPath); "
+    "$sc.TargetPath = $env:LGRAPH_SC_TARGET; "
+    "if ($env:LGRAPH_SC_ARGS) { $sc.Arguments = $env:LGRAPH_SC_ARGS }; "
+    "$sc.WorkingDirectory = $env:LGRAPH_SC_WORKDIR; "
+    "$sc.IconLocation = $env:LGRAPH_SC_ICON; "
+    "$sc.Description = $env:LGRAPH_SC_DESC; "
+    "$sc.Save(); "
+    "Write-Output $lnkPath"
+)
+
+
+def create_desktop_shortcut_and_cli(
+    desktop_dir: Path | None = None,
+    windows_apps_dir: Path | None = None,
+) -> tuple[Path | None, Path | None]:
     """Создаёт ярлык `Lgraph.lnk` на Рабочем столе Windows и команду `lgraph.cmd` в WindowsApps."""
     if os.name != "nt":
         return None, None
 
-    electron_exe = PROJECT_ROOT / "frontend" / "node_modules" / "electron" / "dist" / "electron.exe"
-    frontend_dir = PROJECT_ROOT / "frontend"
+    target_path, target_args, work_dir = resolve_shortcut_target(PROJECT_ROOT)
     start_bat = PROJECT_ROOT / "START_APP.bat"
 
     cli_path: Path | None = None
-    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
-    if local_app_data:
-        win_apps = Path(local_app_data) / "Microsoft" / "WindowsApps"
-        if win_apps.is_dir():
-            cli_path = win_apps / "lgraph.cmd"
-            cli_path.write_text(format_cmd_launcher_script(start_bat), encoding="utf-8")
+    win_apps = windows_apps_dir
+    if win_apps is None:
+        local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+        if local_app_data:
+            win_apps = Path(local_app_data) / "Microsoft" / "WindowsApps"
+    if win_apps is not None and win_apps.is_dir():
+        cli_path = win_apps / "lgraph.cmd"
+        cli_path.write_text(format_cmd_launcher_script(start_bat), encoding="utf-8", newline="")
 
-    # Все пути передаются через env без интерполяции в исходный код PowerShell (защита от кавычек и спецсимволов)
+    # Все пути и описание передаются через env (UTF-16LE блок процесса Windows) без интерполяции в -Command
     ps_env = dict(os.environ)
-    ps_env["LGRAPH_SC_TARGET"] = str(electron_exe if electron_exe.is_file() else start_bat)
-    ps_env["LGRAPH_SC_ARGS"] = f'"{frontend_dir}"' if electron_exe.is_file() else ""
-    ps_env["LGRAPH_SC_WORKDIR"] = str(frontend_dir)
+    ps_env["LGRAPH_SC_TARGET"] = str(target_path)
+    ps_env["LGRAPH_SC_ARGS"] = target_args
+    ps_env["LGRAPH_SC_WORKDIR"] = str(work_dir)
     ps_env["LGRAPH_SC_ICON"] = f"{LOGO_ICO_PATH},0"
+    ps_env["LGRAPH_SC_DESC"] = SHORTCUT_DESCRIPTION_RU
+    if desktop_dir is not None:
+        ps_env["LGRAPH_SC_DESKTOP"] = str(desktop_dir)
+    else:
+        ps_env.pop("LGRAPH_SC_DESKTOP", None)
 
-    ps_script = (
-        "$desk = [Environment]::GetFolderPath('Desktop'); "
-        "$lnkPath = Join-Path $desk 'Lgraph.lnk'; "
-        "$ws = New-Object -ComObject WScript.Shell; "
-        "$sc = $ws.CreateShortcut($lnkPath); "
-        "$sc.TargetPath = $env:LGRAPH_SC_TARGET; "
-        "if ($env:LGRAPH_SC_ARGS) { $sc.Arguments = $env:LGRAPH_SC_ARGS }; "
-        "$sc.WorkingDirectory = $env:LGRAPH_SC_WORKDIR; "
-        "$sc.IconLocation = $env:LGRAPH_SC_ICON; "
-        "$sc.Description = 'Lgraph — Визуальная карта архитектуры и контрактов'; "
-        "$sc.Save(); "
-        "Write-Output $lnkPath"
-    )
     proc = subprocess.run(
-        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
+        [
+            "powershell",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            POWERSHELL_SHORTCUT_SCRIPT,
+        ],
         env=ps_env,
         capture_output=True,
-        text=True,
+        encoding="utf-8",
+        errors="replace",
         check=True,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
-    shortcut_out = proc.stdout.strip().splitlines()[-1].strip()
+    out_lines = [ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()]
+    shortcut_out = out_lines[-1] if out_lines else ""
     return (Path(shortcut_out) if shortcut_out else None), cli_path
 
 

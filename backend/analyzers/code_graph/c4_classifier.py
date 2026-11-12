@@ -203,19 +203,23 @@ def build_c1_to_c3_hierarchy_and_rollups(
 
     for d_uri, (d_title, sample_rel_path) in domains_meta.items():
         c2_uri = domain_to_container[d_uri]
-        inferred_risk, pat_title, pat_desc = classify_risk_and_pattern(sample_rel_path)
+        norm_sample = normalize_rel_path(sample_rel_path)
+        inferred_risk, pat_title, pat_desc = classify_risk_and_pattern(norm_sample)
         effective_risk = domain_risk_rank.get(d_uri, inferred_risk)
+        has_subdir = "/" in norm_sample
+        c3_rel = norm_sample.rsplit("/", 1)[0] if has_subdir else norm_sample
         extra_nodes.append(
             GraphNodeRecord(
                 uri=d_uri,
                 node_type=NodeType.DOMAIN_MODULE,
                 name=d_title,
-                rel_path=sample_rel_path.rsplit("/", 1)[0] if "/" in sample_rel_path else sample_rel_path,
+                rel_path=c3_rel,
                 c4_level=3,
                 risk_level=effective_risk,
                 summary_ru=pat_desc,
                 pattern_tag=pat_title,
                 parent_uri=c2_uri,
+                meta={"target_kind": "directory" if has_subdir else "file"},
             )
         )
         extra_edges.append(
