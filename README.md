@@ -1,8 +1,8 @@
 <div align="center">
   <img src="frontend/public/logo.png" alt="Lgraph Logo" width="96" height="96" />
-  <h1>Lgraph v2.4.1</h1>
-  <p><strong>Visual Architecture Map, Cross-Language Contract Linker & Zero-Bloat MCP Intelligence for AI Coding Agents</strong></p>
-  <p><em>Визуальная карта архитектуры, сшиватель межъязыковых контрактов и автономный MCP-сервер сжатия контекста для нейросетей (Antigravity, Cursor, Claude Code)</em></p>
+  <h1>Lgraph v2.4.2</h1>
+  <p><strong>Visual Architecture Map, Cross-Language Contract Preflight &amp; Zero-Bloat MCP Intelligence for AI Coding Agents</strong></p>
+  <p><em>Визуальная карта архитектуры, контрактный префлайт межъязыковых мостов и автономный MCP-сервер сжатия контекста для нейросетей (Antigravity, Cursor, Claude Code)</em></p>
 </div>
 
 ---
@@ -51,12 +51,19 @@ SETUP.bat
 
 | Инструмент | Назначение |
 | :--- | :--- |
-| `get_context_pack` | Сжатая капсула контекста задачи (`token_budget=2500`): правила + заметки `C3`/`C4` + мосты + ключевые функции по `PageRank` |
+| `get_context_pack` | Сжатая капсула контекста (`token_budget=2500`): 3-корзинная оценка токенов, секция `OMITTED SUMMARY`, `seeds` из `git diff`/traceback, демпфирование хабов, режимы `impact:`/`understand:` и кэш ревизии PPR |
 | `inspect_node_or_search` | Точный техпаспорт файла/функции с соседями и мостами либо мгновенный полнотекстовый поиск `SQLite FTS5` |
-| `simulate_change_impact` | Двусторонний расчёт радиуса взрыва правок, разделение `signature_changes` / `body_only_changes` и проверка красного контура (`CRITICAL`) |
-| `verify_architecture_rules` | Машинная проверка 5 предикатов `GuardrailEngine` с защитой от опечаток в фильтре путей (`NO FILES MATCHED FILTER`) |
-| `save_architectural_note` | Сохранение человеческого или агентского паспорта смысла в долговременную память (`architectural_notes`) |
-| `open_or_index_project` | Индексация папки проекта с кэшированием по `SHA-256` и полная сводка по узлам и связям |
+| `simulate_change_impact` | Двусторонний радиус взрыва, `CONTRACT PREFLIGHT` (`unupdated_contract_partners`, `broken_bridges_vs_head`, `broken_callers_vs_head`), метрика `bridge_coverage` и проверка красного контура (`CRITICAL`) |
+| `verify_architecture_rules` | Машинная проверка 5 предикатов `GuardrailEngine`, сводка `CONTRACT PREFLIGHT` и защита от опечаток в `only_paths` (`NO FILES MATCHED FILTER`) |
+| `save_architectural_note` | Долговременная память (`architectural_notes`) со штампами `signature_hash`/`provenance`/`TTL`, пометками `[STALE]` и автоканонизацией `c3://domain/...` |
+| `open_or_index_project` | Индексация проекта с кэшем `SHA-256` (`PARSER_SCHEMA_VERSION = 2.4.2`), сводкой `bridge_coverage` и двухуровневой защитой путей (`LGRAPH_ALLOWED_ROOTS` + `st_reparse_tag`) |
+
+### ✨ Что нового в `v2.4.2`
+- **Контрактный префлайт (`CONTRACT PREFLIGHT`) и `bridge_coverage`:** автоматический детектор забытых TS-партнёров при правке FastAPI-хэндлеров, полей `Pydantic`/`SQLModel`/`TypedDict`/`@dataclass` и переименовании маршрутов (без ложно-пустого `impact`), обнаружение оборванных импортов и вызовов против `HEAD`, строгая изоляция `CALLS` внутри языка и отслеживание `tsconfig*.json`/`jsconfig.json`.
+- **Прозрачность капсулы и масштаб 50k узлов:** калиброванная 3-корзинная оценка токенов, добор компактных символов (`continue`), подвал `OMITTED SUMMARY`, извлечение `seeds` из `git diff`/стеков ошибок, штраф утилитарным хабам и кэш ревизии PPR с `notes_stamp` (`4.75 с` → `~409 мс` на новых запросах / `~12 мс` на LRU-кэше на 50k узлах).
+- **Память заметок, периметр путей и телеметрия:** штампы сигнатур, `provenance` (`human`/`agent`), `[STALE]` без затирания свежего докстринга, автомиграция `domain://` → `c3://domain/`, разблокировка папок OneDrive по `st_reparse_tag`, `DENIED_EXACT_ROOTS`/`DENIED_SUBTREE_ROOTS` + `LGRAPH_ALLOWED_ROOTS` и неблокирующая телеметрия капсулы (`*_telemetry.sqlite3` + opt-in `hooks.json`).
+
+Подробная история изменений — в [CHANGELOG.md](CHANGELOG.md).
 
 ### Подключение к Cursor / Claude Code (`mcp_config.json`)
 ```json
