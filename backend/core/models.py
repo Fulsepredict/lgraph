@@ -226,6 +226,13 @@ def redact_inline_secrets(raw_text: str) -> tuple[str, bool]:
     return sanitized, found_secret
 
 
+def sanitize_untrusted_doc_tags(text: str) -> str:
+    """Нейтрализует любые регистронезависимые попытки подделать или закрыть тег `<untrusted_code_doc>`."""
+    if not text:
+        return ""
+    return _UNTRUSTED_DOC_TAG_RE.sub("[filtered]", text)
+
+
 def wrap_untrusted_code_doc(doc_text: str, max_chars: int = 280) -> str:
     """
     Оборачивает комментарии из чужого кода в изолирующий тег, чтобы защитить AI-агента
@@ -235,7 +242,7 @@ def wrap_untrusted_code_doc(doc_text: str, max_chars: int = 280) -> str:
     if not clean:
         return ""
     # Удаляем любые регистронезависимые попытки закрыть или подделать защитный контейнер изнутри комментария
-    clean = _UNTRUSTED_DOC_TAG_RE.sub("[filtered]", clean)
+    clean = sanitize_untrusted_doc_tags(clean)
     if len(clean) > max_chars:
         clean = clean[: max_chars - 3].rstrip() + "..."
     return f"<untrusted_code_doc>{clean}</untrusted_code_doc>"

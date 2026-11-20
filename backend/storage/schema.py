@@ -6,15 +6,21 @@
    с фоновой переиндексацией без ошибок `database is locked`.
 2. Два зеркальных индекса на таблице `edges` (`src -> dst` и `dst -> src`) дают
    обход входящих и исходящих зависимостей за единицы миллисекунд без сканирования таблицы.
-3. Отдельная таблица `architectural_notes` хранит паспорта модулей отдельно от узлов AST,
-   поэтому пересборка файла никогда не стирает человеческие и агентские описания.
+3. Отдельная таблица `architectural_notes` хранит паспорта модулей со штампами сигнатур,
+   происхождением (`provenance`) и сроком актуальности (`ttl_days`) отдельно от узлов AST.
+4. Транзакционные примитивы (`begin_immediate_transaction`, `utc_now_iso`) размещены на
+   нижнем слое DAG (`schema.py`), полностью исключая циклические импорты внутри `storage/`.
 """
 
 from __future__ import annotations
 
 import sqlite3
-from contextlib import closing
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
+
+SQLITE_WRITE_BUSY_TIMEOUT_MS: int = 15000
 
 SCHEMA_DDL: str = """
 CREATE TABLE IF NOT EXISTS projects (
@@ -98,6 +104,11 @@ CREATE TABLE IF NOT EXISTS architectural_notes (
     summary_ru TEXT NOT NULL DEFAULT '',
     risk_level TEXT NOT NULL DEFAULT '',
     updated_at_iso TEXT NOT NULL DEFAULT '',
+    target_signature_hash TEXT NOT NULL DEFAULT '',
+    target_body_hash TEXT NOT NULL DEFAULT '',
+    saved_revision INTEGER NOT NULL DEFAULT 0,
+    provenance TEXT NOT NULL DEFAULT 'human',
+    ttl_days INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (project_id, target_uri)
 );
 
@@ -126,6 +137,36 @@ CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
 """
 
 
+def utc_now_iso() -> str:
+    """Возвращает текущее UTC-время в формате ISO-8601 с микросекундной точностью для детерминированной сортировки."""
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+@contextmanager
+def begin_immediate_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """
+    Явно открывает транзакцию записи `BEGIN IMMEDIATE` до первого `SELECT`.
+    Почему это критично в SQLite WAL: отложенный `with conn:` захватывает write-lock только на первом
+    `INSERT/DELETE`, из-за чего предварительный `SELECT` при параллельной записи из другого процесса
+    не ждёт `busy_timeout`, а сразу падает с `SQLITE_BUSY` (`database is locked`).
+    """
+    conn.execute(f"PRAGMA busy_timeout={SQLITE_WRITE_BUSY_TIMEOUT_MS};")
+    if conn.in_transaction:
+        conn.commit()
+    prev_isolation = conn.isolation_level
+    conn.isolation_level = None
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield conn
+        conn.execute("COMMIT")
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.isolation_level = prev_isolation
+
+
 def open_sqlite_connection(db_path: Path) -> sqlite3.Connection:
     """
     Открывает соединение SQLite с настройками параллельного чтения WAL.
@@ -150,10 +191,47 @@ def _ensure_column_exists(conn: sqlite3.Connection, table_name: str, col_name: s
 
 
 def initialize_database(db_path: Path) -> None:
-    """Создаёт таблицы графа и выполняет безопасную авто-миграцию схемы до версии v2.4."""
+    """Создаёт таблицы графа и выполняет безопасную идемпотентную авто-миграцию схемы до версии v2.4.2."""
     with closing(open_sqlite_connection(db_path)) as conn:
-        with conn:
-            conn.executescript(SCHEMA_DDL)
+        conn.execute(f"PRAGMA busy_timeout={SQLITE_WRITE_BUSY_TIMEOUT_MS};")
+        conn.executescript(SCHEMA_DDL)
+        with begin_immediate_transaction(conn):
             _ensure_column_exists(conn, "projects", "config_mtime_ns", "INTEGER NOT NULL DEFAULT 0")
             _ensure_column_exists(conn, "file_cache", "mtime_ns", "INTEGER NOT NULL DEFAULT 0")
             _ensure_column_exists(conn, "file_cache", "size_bytes", "INTEGER NOT NULL DEFAULT 0")
+            _ensure_column_exists(conn, "architectural_notes", "target_signature_hash", "TEXT NOT NULL DEFAULT ''")
+            _ensure_column_exists(conn, "architectural_notes", "target_body_hash", "TEXT NOT NULL DEFAULT ''")
+            _ensure_column_exists(conn, "architectural_notes", "saved_revision", "INTEGER NOT NULL DEFAULT 0")
+            _ensure_column_exists(conn, "architectural_notes", "provenance", "TEXT NOT NULL DEFAULT 'human'")
+            _ensure_column_exists(conn, "architectural_notes", "ttl_days", "INTEGER NOT NULL DEFAULT 0")
+
+            # Идемпотентная миграция устаревших C3-адресов `domain://<x>` в каноническую схему `c3://domain/<x>`
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO architectural_notes (
+                    project_id, target_uri, summary_ru, risk_level, updated_at_iso,
+                    target_signature_hash, target_body_hash, saved_revision, provenance, ttl_days
+                )
+                SELECT
+                    project_id,
+                    'c3://domain/' || LTRIM(SUBSTR(target_uri, 10), '/'),
+                    summary_ru,
+                    risk_level,
+                    updated_at_iso,
+                    target_signature_hash,
+                    target_body_hash,
+                    saved_revision,
+                    provenance,
+                    ttl_days
+                FROM architectural_notes
+                WHERE target_uri LIKE 'domain://%'
+                  AND LENGTH(LTRIM(SUBSTR(target_uri, 10), '/')) > 0
+                """
+            )
+            conn.execute(
+                """
+                DELETE FROM architectural_notes
+                WHERE target_uri LIKE 'domain://%'
+                  AND LENGTH(LTRIM(SUBSTR(target_uri, 10), '/')) > 0
+                """
+            )

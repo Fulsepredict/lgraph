@@ -11,10 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import sqlite3
-from collections.abc import Iterator
-from contextlib import closing, contextmanager
-from datetime import datetime, timezone
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -28,38 +25,25 @@ from backend.core.models import (
     RiskLevel,
     redact_inline_secrets,
 )
-from backend.storage.schema import initialize_database, open_sqlite_connection
+from backend.storage.note_telemetry_store import (
+    evaluate_note_staleness,
+    normalize_note_target_uri,
+)
+from backend.storage.schema import (
+    SQLITE_WRITE_BUSY_TIMEOUT_MS,
+    begin_immediate_transaction,
+    initialize_database,
+    open_sqlite_connection,
+    utc_now_iso,
+)
 
-SQLITE_WRITE_BUSY_TIMEOUT_MS: int = 15000
-
-
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-@contextmanager
-def begin_immediate_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
-    """
-    Явно открывает транзакцию записи `BEGIN IMMEDIATE` до первого `SELECT`.
-    Почему это критично в SQLite WAL: отложенный `with conn:` захватывает write-lock только на первом
-    `INSERT/DELETE`, из-за чего предварительный `SELECT` при параллельной записи из другого процесса
-    не ждёт `busy_timeout`, а сразу падает с `SQLITE_BUSY` (`database is locked`).
-    """
-    conn.execute(f"PRAGMA busy_timeout={SQLITE_WRITE_BUSY_TIMEOUT_MS};")
-    if conn.in_transaction:
-        conn.commit()
-    prev_isolation = conn.isolation_level
-    conn.isolation_level = None
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        yield conn
-        conn.execute("COMMIT")
-    except BaseException:
-        if conn.in_transaction:
-            conn.execute("ROLLBACK")
-        raise
-    finally:
-        conn.isolation_level = prev_isolation
+__all__ = [
+    "GraphRepository",
+    "SQLITE_WRITE_BUSY_TIMEOUT_MS",
+    "begin_immediate_transaction",
+    "compute_project_id",
+    "utc_now_iso",
+]
 
 
 def compute_project_id(root_path: Path) -> str:
@@ -119,6 +103,15 @@ class GraphRepository:
             ).fetchall()
         return {str(r["rel_path"]): dict(r) for r in rows}
 
+    def get_file_cache_metadata_map(self, project_id: str) -> dict[str, dict[str, Any]]:
+        """Возвращает лёгкую карту метаданных кэша БЕЗ чтения тяжёлого `cached_payload_json`."""
+        with closing(open_sqlite_connection(self.db_path)) as conn:
+            rows = conn.execute(
+                "SELECT rel_path, parser_version, mtime_ns, size_bytes FROM file_cache WHERE project_id = ?",
+                (project_id,),
+            ).fetchall()
+        return {str(r["rel_path"]): dict(r) for r in rows}
+
     def save_full_index_atomic(
         self,
         project_id: str,
@@ -129,8 +122,8 @@ class GraphRepository:
         config_mtime_ns: int = 0,
     ) -> int:
         """
-        Атомарно сохраняет новую ревизию графа, накладывая поверх сохранённые
-        пользовательские/агентские заметки из `architectural_notes`.
+        Атомарно сохраняет новую ревизию графа, применяя трёхветвевое правило наложения
+        сохранённых заметок из `architectural_notes` без потери свежих докстрингов при устаревании.
         """
         now_iso = utc_now_iso()
         with closing(open_sqlite_connection(self.db_path)) as conn:
@@ -142,10 +135,21 @@ class GraphRepository:
                 next_rev = (int(rev_row["index_revision"]) if rev_row else 0) + 1
 
                 notes_rows = conn.execute(
-                    "SELECT target_uri, summary_ru, risk_level FROM architectural_notes WHERE project_id = ?",
+                    """
+                    SELECT
+                        target_uri, summary_ru, risk_level, updated_at_iso,
+                        target_signature_hash, target_body_hash, saved_revision, provenance, ttl_days
+                    FROM architectural_notes
+                    WHERE project_id = ?
+                    """,
                     (project_id,),
                 ).fetchall()
-                notes_by_uri = {str(r["target_uri"]): dict(r) for r in notes_rows}
+                notes_by_uri: dict[str, dict[str, Any]] = {}
+                for r in notes_rows:
+                    row_dict = dict(r)
+                    norm_key = normalize_note_target_uri(str(row_dict["target_uri"]))
+                    if norm_key not in notes_by_uri or str(row_dict["target_uri"]) == norm_key:
+                        notes_by_uri[norm_key] = row_dict
 
                 conn.execute("DELETE FROM nodes WHERE project_id = ?", (project_id,))
                 conn.execute("DELETE FROM edges WHERE project_id = ?", (project_id,))
@@ -156,7 +160,14 @@ class GraphRepository:
                 fts_tuples: list[tuple[Any, ...]] = []
                 for n in nodes:
                     saved_note = notes_by_uri.get(n.uri)
-                    raw_summary = saved_note["summary_ru"] if saved_note is not None else n.summary_ru
+                    if saved_note is None:
+                        raw_summary = n.summary_ru
+                    elif str(saved_note["summary_ru"]) == "":
+                        # Явно очищенная пользователем заметка не должна воскрешать прежний докстринг
+                        raw_summary = ""
+                    else:
+                        is_stale, _ = evaluate_note_staleness(saved_note, n)
+                        raw_summary = n.summary_ru if is_stale else str(saved_note["summary_ru"])
                     summary_ru, _ = redact_inline_secrets(raw_summary)
                     safe_sig, _ = redact_inline_secrets(n.signature)
                     risk_val = (

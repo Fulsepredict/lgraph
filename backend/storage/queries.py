@@ -2,7 +2,7 @@
 Запросы чтения, полнотекстового поиска FTS5 и безопасного рекурсивного обхода графа.
 
 Почему рекурсивный обход вынесен отдельно от записи:
-Разделение чтения (CQRS-подход) позволяет держать каждый файл компактным (< 250 строк)
+Разделение чтения (CQRS-подход) позволяет держать каждый файл компактным (`<= 350` строк)
 и оптимизировать запросы для UI и MCP независимо от транзакций индексатора.
 """
 
@@ -14,8 +14,15 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
-from backend.core.models import GuardrailRuleSpec, redact_inline_secrets
-from backend.storage.repository import begin_immediate_transaction, utc_now_iso
+from backend.core.models import GuardrailRuleSpec
+from backend.storage.note_telemetry_store import (
+    list_architectural_notes_enriched,
+    normalize_note_target_uri,
+    record_capsule_edits_and_score as _record_capsule_edits_and_score,
+    record_capsule_pack as _record_capsule_pack,
+    record_capsule_read as _record_capsule_read,
+    save_architectural_note_record,
+)
 from backend.storage.schema import open_sqlite_connection
 
 
@@ -97,20 +104,21 @@ class GraphQueryService:
         return [self._parse_node_row(n) for n in nodes], [self._parse_edge_row(e) for e in edges]
 
     def get_node_by_uri(self, project_id: str, uri: str) -> dict[str, Any] | None:
+        norm_uri = normalize_note_target_uri(uri)
         with closing(open_sqlite_connection(self.db_path)) as conn:
             row = conn.execute(
                 "SELECT * FROM nodes WHERE project_id = ? AND uri = ?",
-                (project_id, uri),
+                (project_id, norm_uri),
             ).fetchone()
             if not row:
                 return None
             inbound = conn.execute(
                 "SELECT * FROM edges WHERE project_id = ? AND dst_uri = ? ORDER BY confidence DESC",
-                (project_id, uri),
+                (project_id, norm_uri),
             ).fetchall()
             outbound = conn.execute(
                 "SELECT * FROM edges WHERE project_id = ? AND src_uri = ? ORDER BY confidence DESC",
-                (project_id, uri),
+                (project_id, norm_uri),
             ).fetchall()
         result = self._parse_node_row(row)
         result["inbound_edges"] = [self._parse_edge_row(e) for e in inbound]
@@ -216,73 +224,65 @@ class GraphQueryService:
         target_uri: str,
         summary_ru: str,
         risk_level: str = "",
+        provenance: str = "human",
+        ttl_days: int = 0,
     ) -> None:
-        clean_summary, _ = redact_inline_secrets(summary_ru.strip())
-        clean_risk = risk_level.strip()
-        now_iso = utc_now_iso()
-        with closing(open_sqlite_connection(self.db_path)) as conn:
-            with begin_immediate_transaction(conn):
-                existing = conn.execute(
-                    "SELECT risk_level FROM architectural_notes WHERE project_id = ? AND target_uri = ?",
-                    (project_id, target_uri),
-                ).fetchone()
-                effective_risk = clean_risk or (str(existing["risk_level"]) if existing else "")
-
-                if not clean_summary and not effective_risk:
-                    conn.execute(
-                        "DELETE FROM architectural_notes WHERE project_id = ? AND target_uri = ?",
-                        (project_id, target_uri),
-                    )
-                else:
-                    conn.execute(
-                        """
-                        INSERT INTO architectural_notes (project_id, target_uri, summary_ru, risk_level, updated_at_iso)
-                        VALUES (?, ?, ?, ?, ?)
-                        ON CONFLICT(project_id, target_uri) DO UPDATE SET
-                            summary_ru = excluded.summary_ru,
-                            risk_level = excluded.risk_level,
-                            updated_at_iso = excluded.updated_at_iso
-                        """,
-                        (project_id, target_uri, clean_summary, effective_risk, now_iso),
-                    )
-
-                # Всегда синхронно обновляем (или очищаем при пустом тексте) заметку в узлах и FTS5
-                conn.execute(
-                    "UPDATE nodes SET summary_ru = ? WHERE project_id = ? AND uri = ?",
-                    (clean_summary, project_id, target_uri),
-                )
-                conn.execute(
-                    "UPDATE nodes_fts SET summary_ru = ? WHERE project_id = ? AND uri = ?",
-                    (clean_summary, project_id, target_uri),
-                )
-                if clean_risk:
-                    conn.execute(
-                        "UPDATE nodes SET risk_level = ? WHERE project_id = ? AND uri = ?",
-                        (clean_risk, project_id, target_uri),
-                    )
+        save_architectural_note_record(
+            self.db_path,
+            project_id=project_id,
+            target_uri=target_uri,
+            summary_ru=summary_ru,
+            risk_level=risk_level,
+            provenance=provenance,
+            ttl_days=ttl_days,
+        )
 
     def get_architectural_notes(self, project_id: str) -> list[dict[str, Any]]:
-        """Возвращает сохранённые человеком и ИИ паспорта модулей (включая карточки C3 и файлы C4)."""
-        with closing(open_sqlite_connection(self.db_path)) as conn:
-            rows = conn.execute(
-                """
-                SELECT
-                    a.target_uri,
-                    a.summary_ru,
-                    a.risk_level AS note_risk_level,
-                    a.updated_at_iso,
-                    COALESCE(n.name, a.target_uri) AS name,
-                    COALESCE(n.rel_path, '') AS rel_path,
-                    COALESCE(n.node_type, 'Note') AS node_type,
-                    COALESCE(n.c4_level, 4) AS c4_level
-                FROM architectural_notes a
-                LEFT JOIN nodes n ON n.project_id = a.project_id AND n.uri = a.target_uri
-                WHERE a.project_id = ? AND a.summary_ru != ''
-                ORDER BY c4_level ASC, a.updated_at_iso DESC
-                """,
-                (project_id,),
-            ).fetchall()
-        return [dict(r) for r in rows]
+        """Возвращает сохранённые человеком и ИИ паспорта модулей (с проверкой устаревания и приоритетом риска)."""
+        return list_architectural_notes_enriched(self.db_path, project_id)
+
+    def record_capsule_pack(
+        self,
+        project_id: str,
+        index_revision: int,
+        packed_uris: list[str],
+        omitted_uris: list[str],
+        task_key: str = "",
+    ) -> None:
+        _record_capsule_pack(
+            self.db_path,
+            project_id=project_id,
+            index_revision=index_revision,
+            packed_uris=packed_uris,
+            omitted_uris=omitted_uris,
+            task_key=task_key,
+        )
+
+    def record_capsule_read(
+        self,
+        project_id: str,
+        read_uris: list[str],
+        task_key: str = "",
+    ) -> None:
+        _record_capsule_read(
+            self.db_path,
+            project_id=project_id,
+            read_uris=read_uris,
+            task_key=task_key,
+        )
+
+    def record_capsule_edits_and_score(
+        self,
+        project_id: str,
+        edited_uris: list[str],
+        task_key: str = "",
+    ) -> dict[str, Any]:
+        return _record_capsule_edits_and_score(
+            self.db_path,
+            project_id=project_id,
+            edited_uris=edited_uris,
+            task_key=task_key,
+        )
 
     def get_guardrail_rules(self, project_id: str) -> list[GuardrailRuleSpec]:
         with closing(open_sqlite_connection(self.db_path)) as conn:
