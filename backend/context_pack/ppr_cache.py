@@ -70,7 +70,7 @@ class RevisionGraphSnapshot:
 
 
 _CACHE_LOCK = threading.Lock()
-_SNAPSHOT_CACHE: OrderedDict[tuple[str, str, int], RevisionGraphSnapshot] = OrderedDict()
+_SNAPSHOT_CACHE: OrderedDict[tuple[str, str, int, str], RevisionGraphSnapshot] = OrderedDict()
 _PPR_VECTOR_CACHE: OrderedDict[tuple[str, str, int, str, str], dict[str, float]] = OrderedDict()
 
 
@@ -82,13 +82,23 @@ def clear_ppr_caches() -> None:
 
 
 def fetch_project_header(db_path: Path, project_id: str) -> dict[str, Any] | None:
-    """Читает строку метаданных проекта по PK за O(1) без полного сканирования таблиц `nodes`/`edges`."""
+    """Читает метаданные проекта и штамп `architectural_notes` в одном соединении без полного сканирования графа."""
     with closing(open_sqlite_connection(db_path)) as conn:
         row = conn.execute(
             "SELECT project_id, name, root_path, index_revision, is_stale FROM projects WHERE project_id = ?",
             (project_id,),
         ).fetchone()
-    return dict(row) if row else None
+        if not row:
+            return None
+        nt_row = conn.execute(
+            "SELECT COUNT(*) AS cnt, COALESCE(MAX(updated_at_iso), '') AS max_ts, "
+            "COALESCE(SUM(LENGTH(summary_ru) + LENGTH(risk_level)), 0) AS payload_len "
+            "FROM architectural_notes WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()
+    hdr = dict(row)
+    hdr["notes_stamp"] = f"{int(nt_row['cnt'])}:{nt_row['max_ts']}:{int(nt_row['payload_len'])}" if nt_row else "0::0"
+    return hdr
 
 
 def _lru_get(cache: OrderedDict[Any, Any], key: Any) -> Any:
@@ -222,10 +232,12 @@ def _load_revision_snapshot_from_db(
     )
 
 
-def get_or_load_revision_snapshot(db_path: Path, project_id: str, index_revision: int) -> RevisionGraphSnapshot:
+def get_or_load_revision_snapshot(
+    db_path: Path, project_id: str, index_revision: int, notes_stamp: str = ""
+) -> RevisionGraphSnapshot:
     """Возвращает снимок ревизии из LRU-кэша (max=4) или загружает его вне `_CACHE_LOCK`."""
     db_key = str(db_path.resolve())
-    snap_key = (db_key, project_id, int(index_revision))
+    snap_key = (db_key, project_id, int(index_revision), str(notes_stamp or ""))
     cached = _lru_get(_SNAPSHOT_CACHE, snap_key)
     if cached is not None:
         return cached

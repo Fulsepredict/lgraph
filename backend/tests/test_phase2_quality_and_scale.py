@@ -605,15 +605,35 @@ def helper_clearable() -> int:
             self.assertTrue(ttl_notes["c3://domain/backend/api"]["is_stale"])
             self.assertEqual(ttl_notes["c3://domain/backend/api"]["stale_reason"], "ttl_expired")
 
-            # 6. Очищенная заметка (`summary_ru=""`, `risk_level="critical"`) остаётся `""` после переиндексации
+            # 6. P1-1 Repro A: risk-only (`summary_ru=""`, `risk_level="critical"`) на прогретом кэше БЕЗ переиндексации
             clear_uri = "py://backend/api/pulse.py#helper_clearable"
-            queries.save_architectural_note(pid, clear_uri, "Временная заметка", risk_level="critical")
+            pre_pack = build_context_pack_markdown(pid, queries, [clear_uri], token_budget=2500, project_root=proj)
+            self.assertIn("Докстринг который нужно очистить.", pre_pack["context_markdown"])
+            self.assertNotIn("[CRITICAL!]", pre_pack["context_markdown"])
+
             queries.save_architectural_note(pid, clear_uri, "", risk_level="critical")
+            risk_only_pack = build_context_pack_markdown(pid, queries, [clear_uri], token_budget=2500, project_root=proj)
+            self.assertIn("[CRITICAL!]", risk_only_pack["context_markdown"])
+            self.assertNotIn("CriticalNodes=0", risk_only_pack["context_markdown"])
+            self.assertNotIn("Докстринг который нужно очистить.", risk_only_pack["context_markdown"])
+
+            # После переиндексации очищенная заметка (`summary_ru=""`, `risk_level="critical"`) остаётся `""`
             index_project_directory(proj, repo)
             cleared_node = queries.get_node_by_uri(pid, clear_uri)
             assert cleared_node is not None
             self.assertEqual(cleared_node["summary_ru"], "")
             self.assertEqual(cleared_node["risk_level"], "critical")
+
+            # 7. P1-1 Repro B: удаление заметки (`summary_ru=""`, `risk_level=""`) после прогрева кэша БЕЗ переиндексации
+            del_uri = "py://backend/api/pulse.py"
+            queries.save_architectural_note(pid, del_uri, "TEMPORARY_ZOMBIE_NOTE_TEXT", risk_level="")
+            index_project_directory(proj, repo)
+            warm_before_del = build_context_pack_markdown(pid, queries, [del_uri], token_budget=2500, project_root=proj)
+            self.assertIn("TEMPORARY_ZOMBIE_NOTE_TEXT", warm_before_del["context_markdown"])
+
+            queries.save_architectural_note(pid, del_uri, "", risk_level="")
+            after_del_pack = build_context_pack_markdown(pid, queries, [del_uri], token_budget=2500, project_root=proj)
+            self.assertNotIn("TEMPORARY_ZOMBIE_NOTE_TEXT", after_del_pack["context_markdown"])
 
     def test_04_i4_path_perimeter_denylist_allowlist_win32_and_onedrive(self) -> None:
         """I4: DENIED_EXACT/SUBTREE_ROOTS, LGRAPH_ALLOWED_ROOTS (+ proj_<id>), \\\\?\\Drive vs UNC, OneDrive vs Junction."""
@@ -1056,6 +1076,27 @@ def helper_clearable() -> int:
             )
             self.assertEqual(bad_proc.returncode, 0)
             self.assertEqual(bad_proc.stdout.strip(), "{}")
+
+            # 3. P1-2: отсутствие lost-update в `_TELEMETRY_BUFFER` при конкурентном pack/read во время I/O
+            from backend.storage import note_telemetry_store as nts
+
+            real_open = nts.open_sqlite_connection
+            injected = {"done": False}
+
+            def _open_with_concurrent_write(path: Path) -> Any:
+                if not injected["done"] and path == tel_path:
+                    injected["done"] = True
+                    queries.record_capsule_pack(pid, 2, ["py://backend/concurrent_c.py#fn_c"], [], task_key="race_k")
+                    queries.record_capsule_read(pid, ["py://backend/concurrent_c.py#fn_c"], task_key="race_k")
+                return real_open(path)
+
+            queries.record_capsule_pack(pid, 1, ["py://backend/a.py#fn_a"], [], task_key="race_k")
+            with mock.patch.object(nts, "open_sqlite_connection", side_effect=_open_with_concurrent_write):
+                queries.record_capsule_edits_and_score(pid, ["backend/a.py"], task_key="race_k")
+            after_race = queries.record_capsule_edits_and_score(pid, ["backend/concurrent_c.py"], task_key="race_k")
+            self.assertEqual(after_race["packed_count"], 2)
+            self.assertEqual(after_race["read_count"], 1)
+            self.assertAlmostEqual(after_race["edit_recall"], 1.0, places=4)
 
 
 if __name__ == "__main__":

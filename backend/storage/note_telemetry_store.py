@@ -174,7 +174,7 @@ def list_architectural_notes_enriched(db_path: Path, project_id: str) -> list[di
             "CASE WHEN LOWER(a.target_uri) LIKE 'domain://%' AND LENGTH(LTRIM(SUBSTR(a.target_uri, 10), '/')) > 0 "
             "THEN 'c3://domain/' || LTRIM(SUBSTR(a.target_uri, 10), '/') ELSE a.target_uri END) "
             "WHERE a.project_id = ? AND a.summary_ru != '' "
-            "ORDER BY CASE a.risk_level WHEN 'critical' THEN 0 WHEN 'medium' THEN 1 WHEN 'low' THEN 2 ELSE 3 END, "
+            "ORDER BY CASE COALESCE(NULLIF(a.risk_level, ''), n.risk_level, '') WHEN 'critical' THEN 0 WHEN 'medium' THEN 1 WHEN 'low' THEN 2 ELSE 3 END, "
             "c4_level ASC, a.updated_at_iso DESC",
             (project_id,),
         ).fetchall()
@@ -329,8 +329,13 @@ def record_capsule_edits_and_score(
 
     with _TELEMETRY_LOCK:
         entry = _get_or_create_entry_locked(key)
-        entry.update(index_revision=index_rev, packed_uris=set(packed_set), omitted_uris=set(omitted_set),
-                     read_uris=set(read_set), edited_uris=set(edited_set), updated_at_iso=now_iso)
+        entry["index_revision"] = max(int(entry["index_revision"]), index_rev)
+        entry["packed_uris"].update(packed_set)
+        entry["omitted_uris"].update(omitted_set)
+        entry["omitted_uris"].difference_update(entry["packed_uris"])
+        entry["read_uris"].update(read_set)
+        entry["edited_uris"].update(edited_set)
+        entry["updated_at_iso"] = max(str(entry["updated_at_iso"]), now_iso)
     return {
         "task_key": effective_key, "packed_count": len(packed_set), "read_count": len(read_set),
         "edited_count": len(edited_set), "edit_recall": edit_recall, "edited_but_omitted_uris": edited_but_omitted,

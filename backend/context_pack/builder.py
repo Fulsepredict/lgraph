@@ -188,7 +188,9 @@ def build_context_pack_markdown(
 
     index_revision = int(proj["index_revision"])
     effective_root = project_root or Path(str(proj.get("root_path") or "."))
-    snapshot = ppr_cache.get_or_load_revision_snapshot(query_service.db_path, project_id, index_revision)
+    snapshot = ppr_cache.get_or_load_revision_snapshot(
+        query_service.db_path, project_id, index_revision, notes_stamp=str(proj.get("notes_stamp") or "")
+    )
     saved_notes = query_service.get_architectural_notes(project_id)
     notes_by_uri = {str(nt["target_uri"]): nt for nt in saved_notes}
     total_nodes, total_edges, total_critical = snapshot.graph_totals
