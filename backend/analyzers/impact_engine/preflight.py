@@ -290,21 +290,28 @@ def run_contract_preflight(
 
     if touched_rel_paths is not None:
         effective_touched = set(touched_rel_paths)
+        partner_touched = effective_touched
     else:
         git_status = inspect_git_working_tree(project_root)
+        git_changed = set(git_status.changed_paths)
         if target_rel_paths is not None:
-            effective_touched = set(target_rel_paths)
+            all_known = {str(n["rel_path"]) for n in nodes if n.get("node_type") == "File" and n.get("rel_path")} | git_changed
+            prefs = [tp.rstrip("/") for tp in target_rel_paths if tp.rstrip("/")]
+            effective_touched = set(target_rel_paths) | {
+                fp for fp in all_known if any(fp == pr or fp.startswith(pr + "/") for pr in prefs)
+            }
             for old_p, new_p in git_status.renamed_pairs:
                 if old_p in effective_touched or new_p in effective_touched:
                     effective_touched.update((old_p, new_p))
+            partner_touched = effective_touched | git_changed
         else:
-            effective_touched = set(git_status.changed_paths)
+            effective_touched = partner_touched = git_changed
 
     code_touched = {rp for rp in effective_touched if Path(rp).suffix.lower() in (PY_EXTENSIONS | JS_TS_EXTENSIONS)}
     snap = head_snapshot if head_snapshot is not None else analyze_head_snapshot_and_diff(project_root, code_touched, nodes)
     cached_payloads = _load_file_cache_payloads(query_service.db_path, project_id) if snap.has_head and snap.head_blobs else {}
 
-    unupdated = _find_unupdated_contract_partners(snap.signature_changes, effective_touched, node_by_uri, edges)
+    unupdated = _find_unupdated_contract_partners(snap.signature_changes, partner_touched, node_by_uri, edges)
     broken_bridges = _detect_broken_bridges_vs_head(project_root, snap, cached_payloads)
     broken_callers = _detect_broken_callers_vs_head(project_root, snap, cached_payloads, nodes)
     return {

@@ -157,9 +157,11 @@ def is_project_disk_dirty(project_root: Path, repo: GraphRepository, project_id:
             return True
         if row.get("parser_version") != PARSER_SCHEMA_VERSION:
             return True
-        if int(row.get("size_bytes") or -1) != size_bytes:
+        cached_size = row.get("size_bytes")
+        cached_mtime = row.get("mtime_ns")
+        if cached_size is None or int(cached_size) != size_bytes:
             return True
-        if int(row.get("mtime_ns") or -1) != mtime_ns:
+        if cached_mtime is None or int(cached_mtime) != mtime_ns:
             return True
 
     return False

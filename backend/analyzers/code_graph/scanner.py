@@ -149,8 +149,8 @@ def _index_project_locked(
         if (
             cached_row
             and mtime_ns > 0
-            and int(cached_row.get("mtime_ns") or -1) == mtime_ns
-            and int(cached_row.get("size_bytes") or -1) == size_bytes
+            and cached_row.get("mtime_ns") is not None and int(cached_row["mtime_ns"]) == mtime_ns
+            and cached_row.get("size_bytes") is not None and int(cached_row["size_bytes"]) == size_bytes
             and cached_row.get("parser_version") == PARSER_SCHEMA_VERSION
         ):
             try:

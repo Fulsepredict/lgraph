@@ -28,7 +28,9 @@ def _build_contract_preflight_suffix(
     project_id: str,
     project_root: Path,
     queries: GraphQueryService,
-    scoped_set: set[str] | None,
+    scoped_files: set[str] | None,
+    nodes: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
 ) -> str:
     """Форматирует информационный блок `CONTRACT PREFLIGHT` после основного вердикта правил."""
     from backend.analyzers.impact_engine.preflight import (
@@ -40,7 +42,9 @@ def _build_contract_preflight_suffix(
         project_id,
         project_root,
         queries,
-        target_rel_paths=scoped_set,
+        target_rel_paths=scoped_files,
+        nodes=nodes,
+        edges=edges,
     )
     preflight_block = (format_preflight_markdown_block(preflight) or "").strip()
     return f"\n\n{preflight_block}" if preflight_block else ""
@@ -169,6 +173,7 @@ def execute_verify_guardrails_report(
     all_file_rels = [str(n["rel_path"]) for n in nodes if n.get("node_type") == "File" and n.get("rel_path")]
 
     scoped_set: set[str] | None = None
+    matched_files_set: set[str] | None = None
     unmatched_raw: list[str] = []
     matched_count = len(all_file_rels)
 
@@ -182,7 +187,8 @@ def execute_verify_guardrails_report(
                     scoped_set.add(rel_p)
                 else:
                     unmatched_raw.append(raw_p)
-            matched_count = sum(1 for fp in all_file_rels if matches_focus_paths(fp, scoped_set))
+            matched_files_set = {fp for fp in all_file_rels if matches_focus_paths(fp, scoped_set)}
+            matched_count = len(matched_files_set)
             if matched_count == 0:
                 return (
                     f"⚠️ WARNING: NO FILES MATCHED FILTER `only_paths={cleaned_inputs}`.\n"
@@ -190,9 +196,9 @@ def execute_verify_guardrails_report(
                     "Убедитесь, что путь принадлежит корню проекта и имеет поддерживаемое кодовое расширение (.py, .ts, .tsx, .js)."
                 )
 
-    if scoped_set:
+    if matched_files_set:
         try:
-            queries.record_capsule_edits_and_score(project_id, sorted(scoped_set))
+            queries.record_capsule_edits_and_score(project_id, sorted(matched_files_set))
         except Exception:
             pass
 
@@ -205,7 +211,9 @@ def execute_verify_guardrails_report(
     )
     sync_note = " (индекс автоматически синхронизирован с диском)" if auto_reindexed else ""
     unmatched_note = f"\n⚠️ Примечание: не найдены в индексе пути: {unmatched_raw}" if unmatched_raw else ""
-    preflight_suffix = _build_contract_preflight_suffix(project_id, project_root, queries, scoped_set)
+    preflight_suffix = _build_contract_preflight_suffix(
+        project_id, project_root, queries, matched_files_set, nodes, edges
+    )
 
     if not violations:
         return (
