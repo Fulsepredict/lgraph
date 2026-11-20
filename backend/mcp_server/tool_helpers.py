@@ -21,6 +21,29 @@ from backend.core.models import to_project_rel_path
 from backend.storage.queries import GraphQueryService
 
 _LINE_ANCHOR_RE = re.compile(r"^L\d+(?:-L?\d+)?$", re.IGNORECASE)
+TELEMETRY_FTS_TOP_K: int = 5
+
+
+def _build_contract_preflight_suffix(
+    project_id: str,
+    project_root: Path,
+    queries: GraphQueryService,
+    scoped_set: set[str] | None,
+) -> str:
+    """Форматирует информационный блок `CONTRACT PREFLIGHT` после основного вердикта правил."""
+    from backend.analyzers.impact_engine.preflight import (
+        format_preflight_markdown_block,
+        run_contract_preflight,
+    )
+
+    preflight = run_contract_preflight(
+        project_id,
+        project_root,
+        queries,
+        target_rel_paths=scoped_set,
+    )
+    preflight_block = (format_preflight_markdown_block(preflight) or "").strip()
+    return f"\n\n{preflight_block}" if preflight_block else ""
 
 
 def execute_inspect_or_search(
@@ -102,6 +125,10 @@ def execute_inspect_or_search(
             "inbound_dependents": queries.traverse_neighbors_safe(project_id, target_uri, "inbound", max_depth=max_depth)[:25],
             "outbound_dependencies": queries.traverse_neighbors_safe(project_id, target_uri, "outbound", max_depth=max_depth)[:25],
         }
+        try:
+            queries.record_capsule_read(project_id, [target_uri])
+        except Exception:
+            pass
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
     hits = queries.search_nodes(project_id, q, limit=15)
@@ -116,6 +143,12 @@ def execute_inspect_or_search(
         }
         for h in hits
     ]
+    try:
+        top_hit_uris = [str(h["uri"]) for h in compact_hits[:TELEMETRY_FTS_TOP_K] if h.get("uri")]
+        if top_hit_uris:
+            queries.record_capsule_read(project_id, top_hit_uris)
+    except Exception:
+        pass
     return json.dumps(
         {"mode": "fts5_search", "query": q, "count": len(compact_hits), "results": compact_hits},
         ensure_ascii=False,
@@ -157,6 +190,12 @@ def execute_verify_guardrails_report(
                     "Убедитесь, что путь принадлежит корню проекта и имеет поддерживаемое кодовое расширение (.py, .ts, .tsx, .js)."
                 )
 
+    if scoped_set:
+        try:
+            queries.record_capsule_edits_and_score(project_id, sorted(scoped_set))
+        except Exception:
+            pass
+
     violations = evaluate_project_guardrails(
         project_root=project_root,
         nodes=nodes,
@@ -166,11 +205,12 @@ def execute_verify_guardrails_report(
     )
     sync_note = " (индекс автоматически синхронизирован с диском)" if auto_reindexed else ""
     unmatched_note = f"\n⚠️ Примечание: не найдены в индексе пути: {unmatched_raw}" if unmatched_raw else ""
+    preflight_suffix = _build_contract_preflight_suffix(project_id, project_root, queries, scoped_set)
 
     if not violations:
         return (
             f"✅ ALL GUARDRAILS PASSED{sync_note}: Проверено файлов в фокусе: {matched_count}/{len(all_file_rels)}. "
-            f"Нарушений архитектурных правил не обнаружено.{unmatched_note}"
+            f"Нарушений архитектурных правил не обнаружено.{unmatched_note}{preflight_suffix}"
         )
 
     lines = [
@@ -186,4 +226,4 @@ def execute_verify_guardrails_report(
             f"\n  Почему нарушено: {v.why_violated_ru}"
             f"\n  Как исправить: {v.how_to_fix_ru}"
         )
-    return "\n".join(lines)
+    return "\n".join(lines) + preflight_suffix

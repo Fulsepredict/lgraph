@@ -141,6 +141,52 @@ def _sync_plugin_dir(src: Path, dst: Path) -> None:
     shutil.copytree(src, dst, dirs_exist_ok=True)
 
 
+def _configure_installed_hooks_json(
+    hooks_cfg_path: Path,
+    resolved_python: str,
+    project_root: Path,
+) -> None:
+    """
+    Подставляет реальные локальные пути в `hooks.json` через JSON-разбор (экранируя `\\` Windows)
+    и гарантированно сохраняет безопасный opt-in статус `"enabled": false`.
+    """
+    if not hooks_cfg_path.is_file():
+        return
+
+    payload = json.loads(hooks_cfg_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        return
+
+    hook_script_abs = str((project_root / "scripts" / "lgraph_telemetry_hook.py").resolve())
+    root_abs = str(project_root.resolve())
+
+    def _substitute_cmd(cmd: str) -> str:
+        updated = cmd.replace("<PATH_TO_LGRAPH>/backend/venv/Scripts/python.exe", resolved_python)
+        updated = updated.replace("<PATH_TO_LGRAPH>\\backend\\venv\\Scripts\\python.exe", resolved_python)
+        updated = updated.replace("<PATH_TO_LGRAPH>/scripts/lgraph_telemetry_hook.py", hook_script_abs)
+        updated = updated.replace("<PATH_TO_LGRAPH>\\scripts\\lgraph_telemetry_hook.py", hook_script_abs)
+        return updated.replace("<PATH_TO_LGRAPH>", root_abs)
+
+    for hook_cfg in payload.values():
+        if not isinstance(hook_cfg, dict):
+            continue
+        for event_name, entries in hook_cfg.items():
+            if event_name == "enabled" or not isinstance(entries, list):
+                continue
+            for item in entries:
+                if not isinstance(item, dict):
+                    continue
+                if isinstance(item.get("command"), str):
+                    item["command"] = _substitute_cmd(item["command"])
+                handlers = item.get("hooks")
+                if isinstance(handlers, list):
+                    for handler in handlers:
+                        if isinstance(handler, dict) and isinstance(handler.get("command"), str):
+                            handler["command"] = _substitute_cmd(handler["command"])
+
+    hooks_cfg_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
 def install_plugins_to_user_profile(target_plugins_root: Path | None = None) -> tuple[Path, Path]:
     raw_root = target_plugins_root or (Path.home() / ".gemini" / "config" / "plugins")
     plugins_root = Path(os.path.abspath(raw_root))
@@ -156,11 +202,12 @@ def install_plugins_to_user_profile(target_plugins_root: Path | None = None) -> 
     lgraph_dst = plugins_root / "lgraph-intelligence"
     _sync_plugin_dir(lgraph_src, lgraph_dst)
 
+    resolved_python = str(resolve_python_executable())
     mcp_cfg_path = lgraph_dst / "mcp_config.json"
     mcp_payload = {
         "mcpServers": {
             "lgraph": {
-                "command": str(resolve_python_executable()),
+                "command": resolved_python,
                 "args": [str((PROJECT_ROOT / "run_mcp_server.py").resolve())],
                 "env": {
                     "PYTHONUTF8": "1",
@@ -170,6 +217,7 @@ def install_plugins_to_user_profile(target_plugins_root: Path | None = None) -> 
         }
     }
     mcp_cfg_path.write_text(json.dumps(mcp_payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    _configure_installed_hooks_json(lgraph_dst / "hooks.json", resolved_python, PROJECT_ROOT)
 
     # 2. Синхронизируем и настраиваем `independent-auditor`
     auditor_src = SOURCE_PLUGINS_DIR / "independent-auditor"
