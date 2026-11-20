@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import gc
 import statistics
 import sys
 import tempfile
@@ -24,6 +25,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 from backend.analyzers.code_graph.scanner import index_project_directory
 from backend.context_pack.builder import build_context_pack_markdown
+from backend.context_pack.ppr_cache import clear_ppr_caches
 from backend.storage.queries import GraphQueryService
 from backend.storage.repository import GraphRepository
 
@@ -86,8 +88,28 @@ def _create_synthetic_bench_m_project(root: Path, domain_count: int = 30) -> Non
     (root / "backend" / "main.py").write_text("\n".join(main_lines + [""] + include_lines), encoding="utf-8")
 
 
-def benchmark_single_target(label: str, target_dir: Path, warm_runs: int = 5) -> dict[str, object]:
+def _measure_peak_ram_bytes(target_dir: Path) -> int:
+    """Выполняет отдельный прогон под `tracemalloc` строго для замера пикового RAM без искажения таймингов."""
+    clear_ppr_caches()
+    gc.collect()
     tracemalloc.start()
+    try:
+        with tempfile.TemporaryDirectory() as tmp_mem:
+            db_mem = Path(tmp_mem) / "bench_mem.sqlite3"
+            repo_mem = GraphRepository(db_mem)
+            queries_mem = GraphQueryService(db_mem)
+            cold_mem = index_project_directory(target_dir, repo_mem)
+            build_context_pack_markdown(cold_mem["project_id"], queries_mem, ["api", "sync"], token_budget=2500)
+            _, peak_bytes = tracemalloc.get_traced_memory()
+            return int(peak_bytes)
+    finally:
+        tracemalloc.stop()
+        clear_ppr_caches()
+
+
+def benchmark_single_target(label: str, target_dir: Path, warm_runs: int = 5) -> dict[str, object]:
+    # 1. Чистый замер wall-clock таймингов с выключенным tracemalloc
+    clear_ppr_caches()
     with tempfile.TemporaryDirectory() as tmp:
         db_path = Path(tmp) / "bench.sqlite3"
         repo = GraphRepository(db_path)
@@ -108,8 +130,8 @@ def benchmark_single_target(label: str, target_dir: Path, warm_runs: int = 5) ->
             build_context_pack_markdown(cold["project_id"], queries, ["api", "sync"], token_budget=2500)
             pack_times.append((time.perf_counter() - tp) * 1000.0)
 
-        _, peak_bytes = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
+    # 2. Отдельный изолированный прогон tracemalloc для замера Peak Python RAM
+    peak_bytes = _measure_peak_ram_bytes(target_dir)
 
     return {
         "label": label,
@@ -126,7 +148,7 @@ def benchmark_single_target(label: str, target_dir: Path, warm_runs: int = 5) ->
 
 
 def main() -> None:
-    print("\n# Lgraph v2.4 — Empirical SLO Benchmark Report\n")
+    print("\n# Lgraph v2.4.2 — Empirical SLO Benchmark Report\n")
     print("| Полигон | Файлов | Узлов | Связей | Cold Index (ms) | Warm Cache p50/p95 (ms) | ContextPack p50/p95 (ms) | Peak Python RAM (MB) |")
     print("|---|---:|---:|---:|---:|---:|---:|---:|")
 
