@@ -5,61 +5,57 @@
 1. На клиенте параметры пишутся как `${orderId}`, а в FastAPI — как `{order_id}` или `{id:int}`.
    Приведение обеих сторон к единой маске `/api/orders/{param}/confirm` с учётом HTTP-метода
    исключает ложные склейки `GET` с `DELETE`.
-2. Для самописных шлюзов (таких как `apiFetch` или `appFetch`) декларативная секция
-   `bridge_adapters` в `lgraph.yaml` и универсальная эвристика `*Fetch` дают высокую точность.
-3. Если аргумент вызова — переменная (`ipcRenderer.invoke(dynamicName)`), анализатор честно
-   помечает вызов как `unresolved_dynamic`, не выдумывая ложных связей.
+2. Для самописных шлюзов (`apiFetch`, `appFetch`, `lgraphFetch`) декларативная секция
+   `bridge_adapters` в `lgraph.yaml` и эвристика `*Fetch` дают высокую точность.
+3. Покрытие `bridge_coverage` и классификация отдельных вызовов вынесены в `coverage.py`,
+   чтобы не плодить лишние строки `BRIDGES_TO` в таблице `edges` и удерживать `linker.py <= 350` строк.
 """
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from backend.analyzers.bridge_linker.coverage import (
+    CUSTOM_FETCH_WRAPPER_RE as _CUSTOM_FETCH_WRAPPER_RE,
+    BridgeCoverageTracker,
+    collect_ipc_targets,
+    match_http_route as _match_http_route,
+    normalize_route_mask,
+    resolve_client_call_site,
+)
 from backend.core.config import is_reparse_or_symlink
 from backend.core.models import (
-    ConfidenceTier, EdgeType, GraphEdgeRecord, GraphNodeRecord, NodeType, RiskLevel,
+    ConfidenceTier,
+    EdgeType,
+    GraphEdgeRecord,
+    GraphNodeRecord,
+    NodeType,
+    RiskLevel,
 )
 
-_LEADING_BASE_INTERP_RE = re.compile(
-    r"^\$\{[^}]*(?:url|host|origin|base|server|endpoint)[^}]*\}",
-    re.IGNORECASE,
-)
-_TEMPLATE_INTERP_RE = re.compile(r"\$\{[^}]+\}")
-_FASTAPI_PARAM_RE = re.compile(r"\{[^}/]+\}")
-_AXIOS_METHOD_RE = re.compile(r"(?:^|\.)axios\.(get|post|put|delete|patch)$")
-_CUSTOM_FETCH_WRAPPER_RE = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*Fetch$")
-
-
-def normalize_route_mask(raw_url: str, prepend_prefix: str = "") -> str:
-    """
-    Приводит шаблон URL клиента или маршрут FastAPI к канонической маске:
-    `${API_BASE_URL}/api/orders/${orderId}/confirm?fast=1` -> `/api/orders/{param}/confirm`
-    """
-    cleaned = raw_url.strip().strip("\"'` ")
-    cleaned = _LEADING_BASE_INTERP_RE.sub("", cleaned)
-    cleaned = re.sub(r"^https?://[^/]+", "", cleaned)
-    cleaned = cleaned.split("?", 1)[0].split("#", 1)[0]
-    cleaned = _TEMPLATE_INTERP_RE.sub("{param}", cleaned)
-    cleaned = _FASTAPI_PARAM_RE.sub("{param}", cleaned)
-
-    if prepend_prefix:
-        pref = "/" + prepend_prefix.strip("/")
-        if not cleaned.startswith(pref + "/") and cleaned != pref:
-            cleaned = pref + ("/" + cleaned.lstrip("/") if cleaned else "")
-
-    norm = "/" + "/".join(seg for seg in cleaned.split("/") if seg)
-    return norm
+__all__ = [
+    "_CUSTOM_FETCH_WRAPPER_RE",
+    "_match_http_route",
+    "_resolve_router_origin_rel_path",
+    "build_server_http_endpoints",
+    "collect_ipc_targets",
+    "extract_http_wrapper_map",
+    "link_cross_language_bridges",
+    "link_cross_language_bridges_with_coverage",
+    "load_project_lgraph_config",
+    "normalize_route_mask",
+    "resolve_client_call_site",
+]
 
 
 def load_project_lgraph_config(project_root: Path) -> dict[str, Any]:
     """
     Читает проектный файл `lgraph.yaml` в режиме Fail-Closed:
-    если файла нет или он пуст — возвращает `{}`, но при ошибке YAML или неверном корневом типе
-    выбрасывает `ValueError`, чтобы опечатка в отступах не обнулила `BLOCKER`-правила в БД.
+    при ошибке YAML или неверном корневом типе выбрасывает `ValueError`, чтобы опечатка
+    в отступах не обнулила `BLOCKER`-правила в БД.
     """
     cfg_path = project_root / "lgraph.yaml"
     if not cfg_path.exists():
@@ -81,6 +77,16 @@ def load_project_lgraph_config(project_root: Path) -> dict[str, Any]:
             f"Ошибка синтаксиса в файле конфигурации {cfg_path}: корень YAML обязан быть словарём, получен {type(loaded).__name__}."
         )
     return loaded
+
+
+def extract_http_wrapper_map(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Извлекает карту пользовательских HTTP-обёрток из секции `bridge_adapters.http_wrappers`."""
+    adapters_cfg = (cfg.get("bridge_adapters") or {}).get("http_wrappers") or []
+    wrapper_map: dict[str, dict[str, Any]] = {}
+    for item in adapters_cfg:
+        if isinstance(item, dict) and item.get("caller_name"):
+            wrapper_map[str(item["caller_name"])] = item
+    return wrapper_map
 
 
 def _resolve_router_origin_rel_path(origin: str, importer_rel_path: str = "") -> list[str]:
@@ -114,47 +120,11 @@ def _resolve_router_origin_rel_path(origin: str, importer_rel_path: str = "") ->
     return cands
 
 
-def _match_http_route(
-    server_endpoints: dict[tuple[str, str], list[str]], method: str, candidate_mask: str
-) -> tuple[str, list[str]]:
-    """Находит точный маршрут либо параметризованный шаблон `{param}` той же длины и HTTP-метода."""
-    exact = server_endpoints.get((method, candidate_mask))
-    if exact:
-        return candidate_mask, exact
-    c_segs = [s for s in candidate_mask.split("/") if s]
-    best_mask, best_targets, best_static = candidate_mask, [], -1
-    for (srv_m, srv_mask), targets in server_endpoints.items():
-        if srv_m != method or "{param}" not in srv_mask:
-            continue
-        s_segs = [s for s in srv_mask.split("/") if s]
-        static_cnt = sum(1 for s in s_segs if s != "{param}")
-        if len(s_segs) == len(c_segs) and static_cnt > best_static and static_cnt >= 1:
-            if all(ss == "{param}" or cs == ss for cs, ss in zip(c_segs, s_segs)):
-                best_mask, best_targets, best_static = srv_mask, targets, static_cnt
-    return best_mask, best_targets
-
-
-def link_cross_language_bridges(
-    project_root: Path,
+def build_server_http_endpoints(
     py_routes_by_file: dict[str, list[dict[str, Any]]],
     py_router_includes: list[dict[str, str]],
-    js_call_sites: list[dict[str, Any]],
-    all_nodes: list[GraphNodeRecord],
-) -> tuple[list[GraphNodeRecord], list[GraphEdgeRecord]]:
-    """
-    Сопоставляет межъязыковые HTTP-маршруты, каналы Electron IPC и общие схемы данных.
-    Возвращает дополнительные узлы (например, `unresolved_dynamic`) и рёбра `BRIDGES_TO` / `USES_CONTRACT`.
-    """
-    cfg = load_project_lgraph_config(project_root)
-    adapters_cfg = (cfg.get("bridge_adapters") or {}).get("http_wrappers") or []
-
-    # Пользовательские обёртки из `lgraph.yaml` (дополняются универсальной эвристикой `*Fetch`)
-    wrapper_map: dict[str, dict[str, Any]] = {}
-    for item in adapters_cfg:
-        if isinstance(item, dict) and item.get("caller_name"):
-            wrapper_map[str(item["caller_name"])] = item
-
-    # 1. Вычисляем полные префиксы FastAPI роутеров из `app.include_router(router_var, prefix=...)`
+) -> dict[tuple[str, str], list[str]]:
+    """Строит таблицу канонических серверных маршрутов `(METHOD, mask) -> [func_uri]` с учётом `include_router`."""
     file_router_prefixes: dict[str, list[str]] = {}
     exact_only_keys: set[str] = set()
     for inc in py_router_includes:
@@ -167,7 +137,6 @@ def link_cross_language_bridges(
             if importer_rel and origin.startswith("."):
                 exact_only_keys.add(cand_rel)
 
-    # 2. Строим таблицу канонических серверных маршрутов `(METHOD, mask) -> [func_uri]`
     server_endpoints: dict[tuple[str, str], list[str]] = {}
     for rel_py, routes in py_routes_by_file.items():
         matched_prefixes = list(file_router_prefixes.get(rel_py) or [])
@@ -182,23 +151,27 @@ def link_cross_language_bridges(
                 key = (rt["method"].upper(), mask)
                 if rt["func_uri"] not in server_endpoints.setdefault(key, []):
                     server_endpoints[key].append(rt["func_uri"])
+    return server_endpoints
 
-    # 3. Собираем обработчики Electron IPC (`ipcMain.handle/on` и клиентские слушатели `ipcRenderer.on/once`)
-    ipc_handlers: dict[str, list[str]] = {}
-    ipc_renderer_listeners: dict[str, list[str]] = {}
-    for cs in js_call_sites:
-        callee = cs["callee"]
-        if callee in ("ipcMain.handle", "ipcMain.on", "electron.ipcMain.handle", "electron.ipcMain.on") and cs["first_arg_type"] in ("string", "template_string"):
-            ch_name = cs["first_arg_raw"].strip("\"'` ")
-            if ch_name and "${" not in ch_name and cs["caller_uri"] not in ipc_handlers.setdefault(ch_name, []):
-                ipc_handlers[ch_name].append(cs["caller_uri"])
-        elif callee in ("ipcRenderer.on", "ipcRenderer.once", "electron.ipcRenderer.on") and cs["first_arg_type"] in ("string", "template_string"):
-            ch_name = cs["first_arg_raw"].strip("\"'` ")
-            if ch_name and "${" not in ch_name and cs["caller_uri"] not in ipc_renderer_listeners.setdefault(ch_name, []):
-                ipc_renderer_listeners[ch_name].append(cs["caller_uri"])
+
+def link_cross_language_bridges_with_coverage(
+    project_root: Path,
+    py_routes_by_file: dict[str, list[dict[str, Any]]],
+    py_router_includes: list[dict[str, str]],
+    js_call_sites: list[dict[str, Any]],
+    all_nodes: list[GraphNodeRecord],
+) -> tuple[list[GraphNodeRecord], list[GraphEdgeRecord], dict[str, Any]]:
+    """
+    Сопоставляет межъязыковые HTTP-маршруты, каналы Electron IPC и общие схемы данных.
+    Возвращает `(bridge_nodes, bridge_edges, bridge_coverage)`.
+    """
+    wrapper_map = extract_http_wrapper_map(load_project_lgraph_config(project_root))
+    server_endpoints = build_server_http_endpoints(py_routes_by_file, py_router_includes)
+    ipc_handlers, ipc_renderer_listeners = collect_ipc_targets(js_call_sites)
 
     bridge_nodes: list[GraphNodeRecord] = []
     bridge_edges: list[GraphEdgeRecord] = []
+    tracker = BridgeCoverageTracker()
     unresolved_node_created = False
 
     def _ensure_unresolved_node() -> str:
@@ -215,106 +188,50 @@ def link_cross_language_bridges(
             )
         return uri
 
-    # 4. Сопоставляем клиентские HTTP и IPC вызовы с сервером и Electron Main
     for cs in js_call_sites:
-        callee, arg_raw, arg_type = cs["callee"], cs["first_arg_raw"], cs["first_arg_type"]
-        short_callee = callee.rsplit(".", 1)[-1]
-
-        # А) Клиентские IPC вызовы (`ipcRenderer.invoke`, `ipcRenderer.send`)
-        if callee in ("ipcRenderer.invoke", "ipcRenderer.send", "electron.ipcRenderer.invoke"):
-            if arg_type not in ("string", "template_string") or "${" in arg_raw:
-                dyn_uri = _ensure_unresolved_node()
+        res = resolve_client_call_site(cs, server_endpoints, ipc_handlers, ipc_renderer_listeners, wrapper_map)
+        if res is None:
+            continue
+        status, proto = res["status"], res["protocol"]
+        if status == "wrapper_passthrough":
+            tracker.record_wrapper_passthrough()
+            continue
+        if status == "unresolved_dynamic":
+            tracker.record_unresolved(
+                {"protocol": proto, "caller_uri": cs["caller_uri"], "callee": cs["callee"], "arg": cs["first_arg_raw"], "line": cs["line"]}
+            )
+            if res["emit_unresolved_edge"]:
                 bridge_edges.append(
                     GraphEdgeRecord(
-                        src_uri=cs["caller_uri"],
-                        dst_uri=dyn_uri,
-                        edge_type=EdgeType.BRIDGES_TO,
-                        confidence=0.35,
-                        confidence_tier=ConfidenceTier.UNRESOLVED_DYNAMIC,
-                        source_module="bridge_linker",
-                        evidence=f"IPC dynamic call `{callee}({arg_raw})` at line {cs['line']}",
+                        src_uri=cs["caller_uri"], dst_uri=_ensure_unresolved_node(), edge_type=EdgeType.BRIDGES_TO,
+                        confidence=0.35, confidence_tier=ConfidenceTier.UNRESOLVED_DYNAMIC, source_module="bridge_linker",
+                        evidence=f"IPC dynamic call `{cs['callee']}({cs['first_arg_raw']})` at line {cs['line']}",
                         meta={"protocol": "IPC", "dynamic": True},
                     )
                 )
-            else:
-                ch_name = arg_raw.strip("\"'` ")
-                for handler_uri in ipc_handlers.get(ch_name, []):
-                    bridge_edges.append(
-                        GraphEdgeRecord(
-                            src_uri=cs["caller_uri"],
-                            dst_uri=handler_uri,
-                            edge_type=EdgeType.BRIDGES_TO,
-                            confidence=1.0,
-                            confidence_tier=ConfidenceTier.EXACT,
-                            source_module="bridge_linker",
-                            evidence=f"IPC channel '{ch_name}'",
-                            meta={"protocol": "IPC", "channel": ch_name},
-                        )
-                    )
             continue
-
-        # А2) Серверные push-события Electron Main -> Renderer (`*.webContents.send('channel', payload)`)
-        if callee == "webContents.send" or callee.endswith(".webContents.send"):
-            if arg_type in ("string", "template_string") and "${" not in arg_raw:
-                ch_name = arg_raw.strip("\"'` ")
-                for listener_uri in ipc_renderer_listeners.get(ch_name, []):
-                    bridge_edges.append(
-                        GraphEdgeRecord(
-                            src_uri=cs["caller_uri"],
-                            dst_uri=listener_uri,
-                            edge_type=EdgeType.BRIDGES_TO,
-                            confidence=1.0,
-                            confidence_tier=ConfidenceTier.EXACT,
-                            source_module="bridge_linker",
-                            evidence=f"IPC push '{ch_name}'",
-                            meta={"protocol": "IPC_PUSH", "channel": ch_name},
-                        )
-                    )
-            continue
-
-        # Б) Клиентские HTTP-вызовы (`fetch`, `axios.*`, кастомные обёртки из `lgraph.yaml` и эвристика `*Fetch`)
-        is_fetch = callee in ("fetch", "window.fetch", "globalThis.fetch")
-        axios_match = _AXIOS_METHOD_RE.search(callee)
-        wrapper_cfg = wrapper_map.get(callee) or wrapper_map.get(short_callee)
-        is_custom_fetch_name = bool(_CUSTOM_FETCH_WRAPPER_RE.match(short_callee)) and not is_fetch
-
-        if not (is_fetch or axios_match or wrapper_cfg or is_custom_fetch_name):
-            continue
-
-        # Пропускаем внутреннее объявление самой обёртки (где первым аргументом идёт переменная `subPath`)
-        if arg_type not in ("string", "template_string"):
-            continue
-
-        http_method = axios_match.group(1).upper() if axios_match else (cs["method_hint"] or "GET")
-        prepend = str(wrapper_cfg.get("prepend_prefix", "")) if wrapper_cfg else ""
-        route_mask, matched_targets = _match_http_route(
-            server_endpoints, http_method, normalize_route_mask(arg_raw, prepend_prefix=prepend)
-        )
-        used_heuristic_prefix = False
-        if not matched_targets and is_custom_fetch_name and not wrapper_cfg:
-            alt_mask, alt_targets = _match_http_route(
-                server_endpoints, http_method, normalize_route_mask(arg_raw, prepend_prefix="/api")
+        if status == "unmatched_static":
+            tracker.record_unmatched(
+                {"protocol": proto, "caller_uri": cs["caller_uri"], "callee": cs["callee"], "endpoint": res["endpoint_key"], "line": cs["line"]}
             )
-            if alt_targets:
-                route_mask, matched_targets, used_heuristic_prefix = alt_mask, alt_targets, True
-        tier = ConfidenceTier.PATTERN_MATCHED if ("{param}" in route_mask or used_heuristic_prefix) else ConfidenceTier.EXACT
-        conf = 0.92 if tier == ConfidenceTier.PATTERN_MATCHED else 1.0
+            continue
 
-        for target_fn_uri in matched_targets:
+        tracker.record_linked(res["tier"])
+        for target_uri in res["targets"]:
+            if proto == "HTTP":
+                ev, meta = res["endpoint_key"], {"protocol": "HTTP", "method": res["method"], "route": res["route_mask"]}
+            elif proto == "IPC":
+                ev, meta = f"IPC channel '{res['route_mask']}'", {"protocol": "IPC", "channel": res["route_mask"]}
+            else:
+                ev, meta = f"IPC push '{res['route_mask']}'", {"protocol": "IPC_PUSH", "channel": res["route_mask"]}
             bridge_edges.append(
                 GraphEdgeRecord(
-                    src_uri=cs["caller_uri"],
-                    dst_uri=target_fn_uri,
-                    edge_type=EdgeType.BRIDGES_TO,
-                    confidence=conf,
-                    confidence_tier=tier,
-                    source_module="bridge_linker",
-                    evidence=f"{http_method} {route_mask}",
-                    meta={"protocol": "HTTP", "method": http_method, "route": route_mask},
+                    src_uri=cs["caller_uri"], dst_uri=target_uri, edge_type=EdgeType.BRIDGES_TO,
+                    confidence=res["confidence"], confidence_tier=res["tier"], source_module="bridge_linker",
+                    evidence=ev, meta=meta,
                 )
             )
 
-    # 5. Сшиваем одноимённые контракты данных (`Pydantic/SQLModel/TypedDict` <-> `TS/JS interface/type`) без потери дублей
     py_contracts: dict[str, list[str]] = {}
     fe_contracts: dict[str, list[str]] = {}
     for n in all_nodes:
@@ -329,14 +246,24 @@ def link_cross_language_bridges(
             for py_u in py_contracts[shared_name]:
                 bridge_edges.append(
                     GraphEdgeRecord(
-                        src_uri=fe_u,
-                        dst_uri=py_u,
-                        edge_type=EdgeType.USES_CONTRACT,
-                        confidence=0.95,
-                        confidence_tier=ConfidenceTier.VERIFIED,
-                        source_module="bridge_linker",
-                        evidence=f"Shared schema `{shared_name}`",
+                        src_uri=fe_u, dst_uri=py_u, edge_type=EdgeType.USES_CONTRACT,
+                        confidence=0.95, confidence_tier=ConfidenceTier.VERIFIED,
+                        source_module="bridge_linker", evidence=f"Shared schema `{shared_name}`",
                     )
                 )
 
+    return bridge_nodes, bridge_edges, tracker.to_dict()
+
+
+def link_cross_language_bridges(
+    project_root: Path,
+    py_routes_by_file: dict[str, list[dict[str, Any]]],
+    py_router_includes: list[dict[str, str]],
+    js_call_sites: list[dict[str, Any]],
+    all_nodes: list[GraphNodeRecord],
+) -> tuple[list[GraphNodeRecord], list[GraphEdgeRecord]]:
+    """Обратно-совместимая обёртка: возвращает `(bridge_nodes, bridge_edges)` без статистики покрытия."""
+    bridge_nodes, bridge_edges, _ = link_cross_language_bridges_with_coverage(
+        project_root, py_routes_by_file, py_router_includes, js_call_sites, all_nodes
+    )
     return bridge_nodes, bridge_edges

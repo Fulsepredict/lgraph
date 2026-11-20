@@ -17,14 +17,13 @@ from typing import Any
 import tree_sitter_python as tspython
 from tree_sitter import Language, Node, Parser
 
+from backend.analyzers.code_graph.call_and_contract_helpers import (
+    build_python_contract_info,
+    extract_python_fn_type_refs,
+)
 from backend.core.models import (
-    GraphNodeRecord,
-    NodeType,
-    RiskLevel,
-    build_canonical_uri,
-    compute_text_hash,
-    redact_inline_secrets,
-    wrap_untrusted_code_doc,
+    GraphNodeRecord, NodeType, RiskLevel, build_canonical_uri,
+    compute_text_hash, redact_inline_secrets, wrap_untrusted_code_doc,
 )
 
 PY_LANGUAGE = Language(tspython.language())
@@ -53,6 +52,8 @@ class PythonFileParseResult:
     nodes: list[GraphNodeRecord] = field(default_factory=list)
     imports: list[tuple[str, list[str]]] = field(default_factory=list)  # (module_path, imported_names)
     calls: list[tuple[str, str]] = field(default_factory=list)          # (caller_uri, called_name)
+    type_refs: list[tuple[str, str]] = field(default_factory=list)      # (owner_uri, type_name)
+    symbol_imports: dict[str, str] = field(default_factory=dict)        # local_name -> "mod:orig_sym"
     fastapi_routes: list[dict[str, Any]] = field(default_factory=list)  # {func_uri, method, path, router_var}
     router_includes: list[dict[str, str]] = field(default_factory=list) # {router_var, prefix, imported_from}
 
@@ -134,7 +135,7 @@ def parse_python_file(rel_path: str, source_bytes: bytes, file_risk: RiskLevel) 
         )
     )
 
-    imported_symbol_origins: dict[str, str] = {}
+    imported_symbol_origins: dict[str, str] = result.symbol_imports
 
     for child in _named_children(root):
         if child.type == "import_statement":
@@ -238,27 +239,20 @@ def _process_top_or_class_item(
         super_txt = _node_text(super_node, source_bytes).strip()
         body_node = actual.child_by_field_name("body")
         cls_uri = build_canonical_uri("py", rel_path, cls_name)
-        sig = f"class {cls_name}{super_txt}"
-        is_pydantic = any(b in super_txt for b in ("BaseModel", "SQLModel", "TypedDict", "BaseSettings"))
-
+        is_contract, is_pydantic, is_dataclass, sig, sig_hash, field_refs = build_python_contract_info(
+            cls_name, super_txt, decorators_text, body_node, source_bytes
+        )
         result.nodes.append(
             GraphNodeRecord(
-                uri=cls_uri,
-                node_type=NodeType.DATA_CONTRACT if is_pydantic else NodeType.CLASS,
-                name=cls_name,
-                rel_path=rel_path,
-                start_line=node.start_point.row + 1,
-                end_line=node.end_point.row + 1,
-                c4_level=4,
-                risk_level=file_risk,
-                signature=sig,
-                signature_hash=compute_text_hash(sig),
+                uri=cls_uri, node_type=NodeType.DATA_CONTRACT if is_contract else NodeType.CLASS,
+                name=cls_name, rel_path=rel_path, start_line=node.start_point.row + 1, end_line=node.end_point.row + 1,
+                c4_level=4, risk_level=file_risk, signature=sig, signature_hash=sig_hash,
                 body_hash=compute_text_hash(_node_text(body_node, source_bytes)),
-                summary_ru=_extract_docstring(body_node, source_bytes),
-                parent_uri=parent_uri,
-                meta={"bases": super_txt, "is_pydantic": is_pydantic},
+                summary_ru=_extract_docstring(body_node, source_bytes), parent_uri=parent_uri,
+                meta={"bases": super_txt, "is_pydantic": is_pydantic, "is_dataclass": is_dataclass},
             )
         )
+        result.type_refs.extend((cls_uri, ref) for ref in field_refs)
         if body_node is not None:
             for member in _named_children(body_node):
                 if member.type in ("function_definition", "decorated_definition"):
@@ -290,21 +284,14 @@ def _process_top_or_class_item(
         is_test = fn_name.startswith("test_") or "/tests/" in f"/{rel_path}/"
         result.nodes.append(
             GraphNodeRecord(
-                uri=fn_uri,
-                node_type=NodeType.TEST if is_test else NodeType.FUNCTION,
-                name=qualname,
-                rel_path=rel_path,
-                start_line=node.start_point.row + 1,
-                end_line=node.end_point.row + 1,
-                c4_level=4,
-                risk_level=file_risk,
-                signature=sig[:240],
-                signature_hash=compute_text_hash(sig),
+                uri=fn_uri, node_type=NodeType.TEST if is_test else NodeType.FUNCTION, name=qualname,
+                rel_path=rel_path, start_line=node.start_point.row + 1, end_line=node.end_point.row + 1,
+                c4_level=4, risk_level=file_risk, signature=sig[:240], signature_hash=compute_text_hash(sig),
                 body_hash=compute_text_hash(_node_text(body_node, source_bytes)),
-                summary_ru=_extract_docstring(body_node, source_bytes),
-                parent_uri=parent_uri,
+                summary_ru=_extract_docstring(body_node, source_bytes), parent_uri=parent_uri,
             )
         )
+        result.type_refs.extend((fn_uri, ref) for ref in extract_python_fn_type_refs(actual, source_bytes))
         if body_node is not None:
             _collect_calls_in_subtree(body_node, fn_uri, source_bytes, result.calls)
             # Поддержка паттерна App Factory (`def create_app(): @app.get(...) def route(): ...`)

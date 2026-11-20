@@ -16,11 +16,20 @@ import time
 from pathlib import Path
 from typing import Any
 
-from backend.analyzers.bridge_linker.linker import link_cross_language_bridges, load_project_lgraph_config
+from backend.analyzers.bridge_linker.linker import (
+    link_cross_language_bridges_with_coverage,
+    load_project_lgraph_config,
+)
 from backend.analyzers.code_graph.c4_classifier import (
     build_c1_to_c3_hierarchy_and_rollups,
     classify_risk_and_pattern,
     resolve_container_and_domain,
+)
+from backend.analyzers.code_graph.call_and_contract_helpers import (
+    build_imported_files_index,
+    resolve_intra_language_calls,
+    resolve_type_annotation_edges,
+    uri_lang_family,
 )
 from backend.analyzers.code_graph.disk_state import (
     PY_EXTENSIONS,
@@ -33,7 +42,7 @@ from backend.analyzers.code_graph.ts_js_parser import JsTsFileParseResult, parse
 from backend.analyzers.code_graph.ts_python_parser import PythonFileParseResult, parse_python_file
 from backend.core.config import PARSER_SCHEMA_VERSION, get_project_index_lock, validate_safe_project_root
 from backend.core.models import (
-    ConfidenceTier, EdgeType, GraphEdgeRecord, GraphNodeRecord, GuardrailRuleSpec,
+    EdgeType, GraphEdgeRecord, GraphNodeRecord, GuardrailRuleSpec,
     NodeType, RiskLevel, compute_sha256_bytes, redact_inline_secrets,
 )
 from backend.storage.repository import GraphRepository
@@ -107,10 +116,14 @@ def _index_project_locked(
     new_cache_entries: list[dict[str, Any]] = []
 
     file_uri_by_rel: dict[str, str] = {}
-    symbol_uris_by_name: dict[str, list[str]] = {}
+    symbol_uris_by_lang_name: dict[tuple[str, str], list[str]] = {}
+    symbol_uris_by_lang_qualname: dict[tuple[str, str], list[str]] = {}
+    type_uris_by_lang_name: dict[tuple[str, str], list[str]] = {}
     pending_py_imports: list[tuple[str, str, list[str]]] = []
     pending_js_imports: list[tuple[str, str, str]] = []
     pending_calls: list[tuple[str, str]] = []
+    pending_type_refs: list[tuple[str, str]] = []
+    symbol_imports_by_file: dict[str, dict[str, str]] = {}
     py_routes_by_file: dict[str, list[dict[str, Any]]] = {}
     py_router_includes: list[dict[str, str]] = []
     js_call_sites: list[dict[str, Any]] = []
@@ -183,6 +196,8 @@ def _index_project_locked(
                     "py_imports": py_res.imports,
                     "js_imports": [],
                     "calls": py_res.calls,
+                    "type_refs": py_res.type_refs,
+                    "symbol_imports": py_res.symbol_imports,
                     "fastapi_routes": py_res.fastapi_routes,
                     "router_includes": py_res.router_includes,
                     "js_call_sites": [],
@@ -197,6 +212,8 @@ def _index_project_locked(
                     "py_imports": [],
                     "js_imports": js_res.imports,
                     "calls": js_res.calls,
+                    "type_refs": js_res.type_refs,
+                    "symbol_imports": js_res.symbol_imports,
                     "fastapi_routes": [],
                     "router_includes": [],
                     "js_call_sites": js_res.raw_call_sites,
@@ -243,21 +260,30 @@ def _index_project_locked(
         for nd in restored_nodes:
             all_nodes.append(nd)
             if nd.node_type != NodeType.FILE:
+                lang_fam = uri_lang_family(nd.uri)
                 short_nm = nd.name.rsplit(".", 1)[-1]
-                symbol_uris_by_name.setdefault(short_nm, []).append(nd.uri)
+                symbol_uris_by_lang_name.setdefault((lang_fam, short_nm), []).append(nd.uri)
+                symbol_uris_by_lang_qualname.setdefault((lang_fam, nd.name), []).append(nd.uri)
+                if nd.node_type in (NodeType.DATA_CONTRACT, NodeType.CLASS):
+                    type_uris_by_lang_name.setdefault((lang_fam, short_nm), []).append(nd.uri)
                 if nd.parent_uri:
                     code_edges.append(GraphEdgeRecord(src_uri=nd.parent_uri, dst_uri=nd.uri, edge_type=EdgeType.CONTAINS))
 
-        for mod_name, imp_names in payload["py_imports"]:
+        for mod_name, imp_names in payload.get("py_imports", []):
             pending_py_imports.append((file_node.uri, mod_name, imp_names))
-        for js_imp in payload["js_imports"]:
+        for js_imp in payload.get("js_imports", []):
             pending_js_imports.append((file_node.uri, rel_path, js_imp))
-        for caller_u, callee_nm in payload["calls"]:
+        for caller_u, callee_nm in payload.get("calls", []):
             pending_calls.append((caller_u, callee_nm))
-        if payload["fastapi_routes"]:
+        for owner_u, ref_nm in payload.get("type_refs", []):
+            pending_type_refs.append((owner_u, ref_nm))
+        sym_imps = payload.get("symbol_imports") or {}
+        if isinstance(sym_imps, dict) and sym_imps:
+            symbol_imports_by_file[rel_path] = sym_imps
+        if payload.get("fastapi_routes"):
             py_routes_by_file[rel_path] = payload["fastapi_routes"]
-        py_router_includes.extend(payload["router_includes"])
-        js_call_sites.extend(payload["js_call_sites"])
+        py_router_includes.extend(payload.get("router_includes", []))
+        js_call_sites.extend(payload.get("js_call_sites", []))
 
         new_cache_entries.append(
             {
@@ -276,64 +302,43 @@ def _index_project_locked(
     resolve_python_imports(pending_py_imports, file_uri_by_rel, code_edges)
     resolve_js_ts_imports(pending_js_imports, file_uri_by_rel, code_edges, project_root=root)
 
-    for caller_uri, raw_callee in pending_calls:
-        short = raw_callee.rsplit(".", 1)[-1]
-        candidates = symbol_uris_by_name.get(short, [])
-        if 1 <= len(candidates) <= 3:
-            conf = 0.85 if len(candidates) == 1 else 0.6
-            for dst_u in candidates:
-                if dst_u != caller_uri:
-                    code_edges.append(
-                        GraphEdgeRecord(
-                            src_uri=caller_uri,
-                            dst_uri=dst_u,
-                            edge_type=EdgeType.CALLS,
-                            confidence=conf,
-                            confidence_tier=ConfidenceTier.HEURISTIC,
-                            evidence=f"calls `{raw_callee}`",
-                        )
-                    )
+    imported_files_by_src = build_imported_files_index(code_edges)
+    resolve_intra_language_calls(
+        pending_calls, symbol_uris_by_lang_name, symbol_uris_by_lang_qualname,
+        imported_files_by_src, symbol_imports_by_file, code_edges,
+    )
+    resolve_type_annotation_edges(
+        pending_type_refs, type_uris_by_lang_name, imported_files_by_src, symbol_imports_by_file, code_edges,
+    )
 
-    bridge_nodes, bridge_edges = link_cross_language_bridges(
-        project_root=root,
-        py_routes_by_file=py_routes_by_file,
-        py_router_includes=py_router_includes,
-        js_call_sites=js_call_sites,
-        all_nodes=all_nodes,
+    bridge_nodes, bridge_edges, bridge_coverage = link_cross_language_bridges_with_coverage(
+        project_root=root, py_routes_by_file=py_routes_by_file,
+        py_router_includes=py_router_includes, js_call_sites=js_call_sites, all_nodes=all_nodes,
     )
     all_nodes.extend(bridge_nodes)
     code_edges.extend(bridge_edges)
 
     c_nodes, c_edges = build_c1_to_c3_hierarchy_and_rollups(
-        project_name=str(proj_row["name"]),
-        file_nodes=file_nodes,
-        code_edges=code_edges,
-        file_to_domain=file_to_domain,
-        domain_to_container=domain_to_container,
-        containers_meta=containers_meta,
-        domains_meta=domains_meta,
+        project_name=str(proj_row["name"]), file_nodes=file_nodes, code_edges=code_edges,
+        file_to_domain=file_to_domain, domain_to_container=domain_to_container,
+        containers_meta=containers_meta, domains_meta=domains_meta,
     )
+    for cn in c_nodes:
+        if cn.uri == "c1://project/self":
+            cn.meta["bridge_coverage"] = bridge_coverage
+            break
     all_nodes.extend(c_nodes)
     code_edges.extend(c_edges)
 
     # Передаём список правил явно (включая `[]`), чтобы удаление правил из lgraph.yaml очищало их в БД
     revision = repo.save_full_index_atomic(
-        project_id=project_id,
-        nodes=all_nodes,
-        edges=code_edges,
-        file_cache_entries=new_cache_entries,
-        guardrail_rules=guardrails,
-        config_mtime_ns=config_fp_ns,
+        project_id=project_id, nodes=all_nodes, edges=code_edges,
+        file_cache_entries=new_cache_entries, guardrail_rules=guardrails, config_mtime_ns=config_fp_ns,
     )
 
     elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
     return {
-        "project_id": project_id,
-        "project_name": proj_row["name"],
-        "index_revision": revision,
-        "elapsed_ms": elapsed_ms,
-        "parsed_files": parsed_files,
-        "cache_hits": cache_hits,
-        "total_nodes": len(all_nodes),
-        "total_edges": len(code_edges),
+        "project_id": project_id, "project_name": proj_row["name"], "index_revision": revision,
+        "elapsed_ms": elapsed_ms, "parsed_files": parsed_files, "cache_hits": cache_hits,
+        "total_nodes": len(all_nodes), "total_edges": len(code_edges), "bridge_coverage": bridge_coverage,
     }

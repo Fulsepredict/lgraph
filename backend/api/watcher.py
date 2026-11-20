@@ -26,6 +26,9 @@ from backend.storage.schema import open_sqlite_connection
 _WATCHED_SUFFIXES: frozenset[str] = frozenset(
     {".py", ".js", ".cjs", ".mjs", ".jsx", ".ts", ".tsx", ".yaml", ".yml"}
 )
+_WATCHED_EXACT_FILENAMES: frozenset[str] = frozenset(
+    {".lgraphignore", ".projectgraphignore", "tsconfig.json", "tsconfig.app.json", "jsconfig.json"}
+)
 _DEBOUNCE_SECONDS: float = 0.45
 
 
@@ -70,7 +73,8 @@ class _DebouncedProjectHandler(FileSystemEventHandler):
         if any(should_ignore_dir(p) for p in rel_parts[:-1]):
             return False
         fname = rel_parts[-1]
-        if fname in (".lgraphignore", ".projectgraphignore"):
+        cmp_fname = fname.lower() if os.name == "nt" else fname
+        if cmp_fname in _WATCHED_EXACT_FILENAMES:
             return True
         return Path(fname).suffix.lower() in _WATCHED_SUFFIXES
 

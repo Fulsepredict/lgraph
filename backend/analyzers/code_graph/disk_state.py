@@ -28,6 +28,8 @@ from backend.storage.repository import GraphRepository
 PY_EXTENSIONS: frozenset[str] = frozenset({".py"})
 JS_TS_EXTENSIONS: frozenset[str] = frozenset({".js", ".cjs", ".mjs", ".jsx", ".ts", ".tsx"})
 CONFIG_WATCH_FILES: tuple[str, ...] = ("lgraph.yaml", ".lgraphignore", ".projectgraphignore")
+TS_CONFIG_WATCH_DIRS: tuple[str, ...] = ("", "frontend", "client", "web", "app")
+TS_CONFIG_WATCH_FILES: tuple[str, ...] = ("tsconfig.app.json", "tsconfig.json", "jsconfig.json")
 
 
 def load_ignore_globs(project_root: Path) -> list[str]:
@@ -49,8 +51,8 @@ def load_ignore_globs(project_root: Path) -> list[str]:
 
 def compute_config_fingerprint_ns(project_root: Path) -> int:
     """
-    Вычисляет компактный 56-битный отпечаток метаданных `lgraph.yaml` и файлов исключений.
-    Если пользователь или агент изменил, создал или удалил `lgraph.yaml` — отпечаток мгновенно меняется.
+    Вычисляет компактный 56-битный отпечаток метаданных `lgraph.yaml`, файлов исключений
+    и конфигов алиасов `tsconfig*.json` / `jsconfig.json` (синхронно с `import_resolver.py`).
     """
     hasher = hashlib.blake2b(digest_size=7)
     for name in CONFIG_WATCH_FILES:
@@ -63,6 +65,25 @@ def compute_config_fingerprint_ns(project_root: Path) -> int:
                 hasher.update(f"{name}:err;".encode("utf-8"))
         else:
             hasher.update(f"{name}:missing;".encode("utf-8"))
+
+    for sub in TS_CONFIG_WATCH_DIRS:
+        cfg_dir = (project_root / sub) if sub else project_root
+        dir_ok = cfg_dir.is_dir() and not is_reparse_or_symlink(cfg_dir)
+        for cfg_name in TS_CONFIG_WATCH_FILES:
+            key = f"{sub}/{cfg_name}" if sub else cfg_name
+            if not dir_ok:
+                hasher.update(f"{key}:missing;".encode("utf-8"))
+                continue
+            cfg_file = cfg_dir / cfg_name
+            if cfg_file.is_file() and not is_reparse_or_symlink(cfg_file):
+                try:
+                    st = cfg_file.stat()
+                    hasher.update(f"{key}:{st.st_mtime_ns}:{st.st_size};".encode("utf-8"))
+                except OSError:
+                    hasher.update(f"{key}:err;".encode("utf-8"))
+            else:
+                hasher.update(f"{key}:missing;".encode("utf-8"))
+
     return int.from_bytes(hasher.digest(), byteorder="big", signed=False)
 
 
@@ -123,7 +144,7 @@ def is_project_disk_dirty(project_root: Path, repo: GraphRepository, project_id:
     if int(proj.get("config_mtime_ns") or 0) != current_cfg_fp:
         return True
 
-    cached_map = repo.get_file_cache_map(project_id)
+    cached_map = repo.get_file_cache_metadata_map(project_id)
     ignore_globs = load_ignore_globs(project_root)
     disk_files = iter_trackable_source_files(project_root, ignore_globs)
 

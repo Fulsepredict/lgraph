@@ -17,6 +17,11 @@ import tree_sitter_javascript as tsjavascript
 import tree_sitter_typescript as tstypescript
 from tree_sitter import Language, Node, Parser
 
+from backend.analyzers.code_graph.call_and_contract_helpers import (
+    extract_ts_fn_type_refs,
+    extract_ts_symbol_imports,
+    extract_ts_type_decl_refs,
+)
 from backend.analyzers.code_graph.ts_js_call_helpers import scan_js_call_expressions
 from backend.core.models import (
     GraphNodeRecord,
@@ -44,6 +49,8 @@ class JsTsFileParseResult:
     nodes: list[GraphNodeRecord] = field(default_factory=list)
     imports: list[str] = field(default_factory=list)
     calls: list[tuple[str, str]] = field(default_factory=list)
+    type_refs: list[tuple[str, str]] = field(default_factory=list)
+    symbol_imports: dict[str, str] = field(default_factory=dict)
     raw_call_sites: list[dict[str, Any]] = field(default_factory=list)
     has_redacted_secret: bool = False
 
@@ -117,6 +124,7 @@ def parse_js_ts_file(rel_path: str, source_bytes: bytes, file_risk: RiskLevel) -
                 result.has_redacted_secret = True
             if imp_str:
                 result.imports.append(imp_str)
+                extract_ts_symbol_imports(child, imp_str, source_bytes, result.symbol_imports)
 
         if actual.type in ("interface_declaration", "type_alias_declaration"):
             name_txt = _node_text(actual.child_by_field_name("name"), source_bytes).strip()
@@ -139,6 +147,7 @@ def parse_js_ts_file(rel_path: str, source_bytes: bytes, file_risk: RiskLevel) -
                         parent_uri=file_uri,
                     )
                 )
+                result.type_refs.extend((uri, ref) for ref in extract_ts_type_decl_refs(actual, name_txt, source_bytes))
 
         elif actual.type == "class_declaration":
             name_txt = _node_text(actual.child_by_field_name("name"), source_bytes).strip()
@@ -280,3 +289,4 @@ def _extract_js_function(
             parent_uri=file_uri,
         )
     )
+    result.type_refs.extend((fn_uri, ref) for ref in extract_ts_fn_type_refs(fn_node, source_bytes))
