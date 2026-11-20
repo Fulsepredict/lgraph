@@ -1,5 +1,5 @@
 """
-MCP-сервер Lgraph v2.4.1 (на базе официального SDK `mcp` v2.x).
+MCP-сервер Lgraph v2.4.2 (на базе официального SDK `mcp` v2.x).
 
 Почему здесь 6 сфокусированных макро-инструментов с авто-проверкой диска (`is_project_disk_dirty`):
 1. ИИ-агент работает с проектом даже тогда, когда визуальное окно Lgraph закрыто (и фоновый Watchdog
@@ -33,8 +33,11 @@ from backend.mcp_server.tool_helpers import (
     execute_inspect_or_search,
     execute_verify_guardrails_report,
 )
+from backend.storage.note_telemetry_store import normalize_note_target_uri
 from backend.storage.queries import GraphQueryService
 from backend.storage.repository import GraphRepository, compute_project_id
+
+AGENT_NOTE_DEFAULT_TTL_DAYS: int = 90
 
 _READONLY_ANNOTATIONS = ToolAnnotations(
     read_only_hint=True,
@@ -62,10 +65,10 @@ def create_lgraph_mcp_server(runtime_dir: Path | None = None) -> MCPServer:
         title="Lgraph Architecture, Contract & Context Intelligence",
         version=LGRAPH_VERSION,
         instructions=(
-            "Протокол качества Lgraph: "
-            "1) ДО чтения сырых файлов незнакомого контура вызовите `get_context_pack` (или `inspect_node_or_search`). "
+            "Протокол качества Lgraph v2.4.2: "
+            "1) ДО чтения сырых файлов незнакомого контура вызовите `get_context_pack` (проверяйте `OMITTED SUMMARY` и пометки `[STALE]` у заметок) или `inspect_node_or_search`. "
             "2) ПЕРЕД изменением API, IPC, схем данных или файлов красного контура вызовите `simulate_change_impact`. "
-            "3) ПОСЛЕ правок обязательно вызовите `verify_architecture_rules` для изменённых файлов и `save_architectural_note` для новых модулей."
+            "3) ПОСЛЕ правок обязательно вызовите `verify_architecture_rules`, проверьте блок `CONTRACT PREFLIGHT` (при правке контрактов повторно `simulate_change_impact`), а для новых C3-модулей (`c3://domain/<контейнер>/<папка>`) сохраните заметку через `save_architectural_note`."
         ),
     )
 
@@ -76,6 +79,7 @@ def create_lgraph_mcp_server(runtime_dir: Path | None = None) -> MCPServer:
                 proj = repo.get_project(cleaned)
                 if not proj:
                     raise ValueError(f"Проект с ID `{cleaned}` ещё не зарегистрирован в Lgraph.")
+                # Повторно валидируем путь из БД, чтобы `LGRAPH_ALLOWED_ROOTS` и denylist действовали и для `proj_<id>`
                 root = validate_safe_project_root(proj["root_path"])
                 pid = cleaned
             else:
@@ -128,6 +132,20 @@ def create_lgraph_mcp_server(runtime_dir: Path | None = None) -> MCPServer:
                 token_budget=token_budget,
                 project_root=root,
             )
+            if "error" not in pack:
+                try:
+                    queries.record_capsule_pack(
+                        pid,
+                        int(pack.get("index_revision") or 0),
+                        list(pack.get("packed_uris") or []),
+                        [
+                            str(x.get("uri", ""))
+                            for x in (pack.get("omitted_symbols") or [])
+                            if isinstance(x, dict) and x.get("uri")
+                        ],
+                    )
+                except Exception:
+                    pass
             return str(pack.get("context_markdown") or json.dumps(pack, ensure_ascii=False))
         except ToolError:
             raise
@@ -219,16 +237,23 @@ def create_lgraph_mcp_server(runtime_dir: Path | None = None) -> MCPServer:
         risk_level: str = "",
     ) -> str:
         try:
-            if risk_level and risk_level not in ("low", "medium", "critical"):
+            clean_risk = risk_level.strip().lower() if risk_level else ""
+            if clean_risk and clean_risk not in ("low", "medium", "critical"):
                 raise ValueError("Параметр risk_level должен быть одним из: '', 'low', 'medium', 'critical'.")
+            raw_uri = target_uri.strip()
+            canonical_uri = normalize_note_target_uri(raw_uri)
+            if not canonical_uri:
+                raise ValueError("Параметр target_uri не может быть пустым.")
             pid, _, _ = _resolve_or_auto_index(project_root_or_id)
             queries.save_architectural_note(
                 project_id=pid,
-                target_uri=target_uri.strip(),
+                target_uri=raw_uri,
                 summary_ru=summary_ru,
-                risk_level=risk_level,
+                risk_level=clean_risk,
+                provenance="agent",
+                ttl_days=AGENT_NOTE_DEFAULT_TTL_DAYS,
             )
-            return f"Заметка успешно сохранена для `{target_uri.strip()}` и синхронизирована с поиском FTS5."
+            return f"Заметка успешно сохранена для `{canonical_uri}` и синхронизирована с поиском FTS5."
         except ToolError:
             raise
         except (ValueError, FileNotFoundError) as exc:

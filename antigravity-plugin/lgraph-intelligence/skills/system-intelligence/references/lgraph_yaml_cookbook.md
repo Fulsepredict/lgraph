@@ -1,7 +1,7 @@
-# 📘 Справочник конфигурации `lgraph.yaml` и `.lgraphignore` (Lgraph v2.4)
+# 📘 Справочник конфигурации `lgraph.yaml` и `.lgraphignore` (Lgraph v2.4.2)
 
 Файл `lgraph.yaml` в корне любого проекта позволяет задать:
-1. **Сетевые и IPC-обёртки (`bridge_adapters`)** — чтобы `BridgeLinker` с точностью 100% сшивал ваши кастомные клиентские функции с маршрутами `FastAPI` и каналами `Electron IPC`.
+1. **Сетевые и IPC-обёртки (`bridge_adapters`)** — чтобы `BridgeLinker` с точностью 100% сшивал ваши кастомные клиентские функции с маршрутами `FastAPI` и каналами `Electron IPC`, не засчитывая внутренние вызовы обёрток как `unresolved_dynamic` в `bridge_coverage`.
 2. **Машинно-проверяемые правила (`guardrails`)** — чтобы `GuardrailEngine` и инструмент `verify_architecture_rules` математически проверяли код и объясняли каждое нарушение простым русским языком.
 
 > Если файла `lgraph.yaml` в проекте пока нет, `Lgraph` автоматически включает два базовых предохранителя: лимит размера файла `<= 350` строк (`GR-CORE-SIZE`) и запрет циклических импортов (`GR-CORE-CYCLES`).
@@ -17,12 +17,13 @@ bridge_adapters:
       prepend_prefix: "/api"              # Автоматически добавляемый префикс URL на сервере
 ```
 
-Что `BridgeLinker` распознаёт автоматически (даже без `lgraph.yaml`):
-- `fetch(...)`, `axios.get/post/put/delete/patch(...)`, методы внутри API-объектов (`export const api = { async save() { ... } }`);
+Что `BridgeLinker` и анализатор контрактов v2.4.2 распознают автоматически (даже без `lgraph.yaml`):
+- `fetch(...)`, `axios.get/post/put/delete/patch(...)`, методы внутри API-объектов (`export const api = { async save() { ... } }`); внутренние вызовы `fetch(subPath)` внутри самих функций-обёрток (`*Fetch` или перечисленных в `http_wrappers`) помечаются как `wrapper_passthrough` и не портят метрику `bridge_coverage`;
 - шаблонные строки с базовым хостом: `` `${API_BASE_URL}/api/orders/${id}` `` и конкатенацию `API_BASE_URL + '/api/orders/' + id`;
-- префиксы роутеров `APIRouter(prefix="/api/orders")` и `app.include_router(router, prefix="/api")`;
+- префиксы роутеров `APIRouter(prefix="/api/orders")`, относительные импорты и `app.include_router(router, prefix="/api")`;
 - двусторонний `Electron IPC`: `ipcRenderer.invoke/send <-> ipcMain.handle/on` и серверные пуши `webContents.send <-> ipcRenderer.on`;
-- общие контракты данных: `Pydantic BaseModel` / `SQLModel` / `TypedDict` / `dataclass` <-> `TypeScript interface` / `type`.
+- общие контракты данных: `Pydantic BaseModel` / `SQLModel` / `TypedDict` / **`@dataclass`** <-> `TypeScript interface` / `type` (включая контроль изменений полей схем в `signature_hash`, ссылки из аннотаций типов и проверку забытых партнёров в `CONTRACT PREFLIGHT`);
+- конфиги алиасов `tsconfig.json`, `tsconfig.app.json` и `jsconfig.json` в корне проекта и подпапках `frontend`, `client`, `web`, `app` автоматически отслеживаются на изменения.
 
 ---
 
@@ -122,4 +123,20 @@ bridge_adapters:
 legacy_archive/**
 frontend/src/generated/**
 *.min.js
+```
+
+---
+
+## 4. Периметр доступа к проектам (`LGRAPH_ALLOWED_ROOTS`)
+
+В `Lgraph v2.4.2` действует двухуровневая защита путей (`validate_safe_project_root`, применяется как к путям `project_root`, так и к обращениям по `proj_<id>`):
+1. **Встроенный запрет системных и секретных каталогов:** корни томов, `C:\Windows`, `Program Files`, `/etc`, `/proc`, `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `%APPDATA%` (Roaming), `%LOCALAPPDATA%\Microsoft\Credentials`, UNC-пути и симлинки/NTFS Junctions отклоняются автоматически. При этом легитимные папки внутри **OneDrive** (`IO_REPARSE_TAG_CLOUD`), локальные пути `\\?\Drive:\...` и подпапки `temp` работают без ложных блокировок.
+2. **Опциональный белый список `LGRAPH_ALLOWED_ROOTS`:** задайте переменную окружения в `mcp_config.json` (разделитель `;` на Windows, `:` на POSIX), чтобы ограничить доступ строго выбранными рабочими корнями (на `LGRAPH_RUNTIME_DIR` этот список не распространяется):
+
+```json
+"env": {
+  "PYTHONUTF8": "1",
+  "PYTHONIOENCODING": "utf-8",
+  "LGRAPH_ALLOWED_ROOTS": "<PATH_TO_WORKSPACES>"
+}
 ```
